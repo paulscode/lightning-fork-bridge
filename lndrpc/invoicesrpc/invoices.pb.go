@@ -191,9 +191,15 @@ type AddHoldInvoiceRequest struct {
 	// invoice's destination.
 	RouteHints []*lnrpc.RouteHint `protobuf:"bytes,8,rep,name=route_hints,json=routeHints,proto3" json:"route_hints,omitempty"`
 	// Whether this invoice should include routing hints for private channels.
-	Private       bool `protobuf:"varint,9,opt,name=private,proto3" json:"private,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Private bool `protobuf:"varint,9,opt,name=private,proto3" json:"private,omitempty"`
+	// Payment metadata (BOLT 11 field m) to put on the invoice: the payer sends
+	// it back with the payment. Setting it also sets the payment_metadata feature
+	// bit (49), as BOLT 11 asks of an invoice that carries one. Lightning Fork
+	// only: stock LND ignores the field, and the number is kept clear of
+	// upstream's.
+	PaymentMetadata []byte `protobuf:"bytes,1000,opt,name=payment_metadata,json=paymentMetadata,proto3" json:"payment_metadata,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *AddHoldInvoiceRequest) Reset() {
@@ -294,6 +300,13 @@ func (x *AddHoldInvoiceRequest) GetPrivate() bool {
 		return x.Private
 	}
 	return false
+}
+
+func (x *AddHoldInvoiceRequest) GetPaymentMetadata() []byte {
+	if x != nil {
+		return x.PaymentMetadata
+	}
+	return nil
 }
 
 type AddHoldInvoiceResp struct {
@@ -825,7 +838,7 @@ const file_invoices_proto_rawDesc = "" +
 	"\x0einvoices.proto\x12\vinvoicesrpc\x1a\x0flightning.proto\"5\n" +
 	"\x10CancelInvoiceMsg\x12!\n" +
 	"\fpayment_hash\x18\x01 \x01(\fR\vpaymentHash\"\x13\n" +
-	"\x11CancelInvoiceResp\"\xca\x02\n" +
+	"\x11CancelInvoiceResp\"\xf6\x02\n" +
 	"\x15AddHoldInvoiceRequest\x12\x12\n" +
 	"\x04memo\x18\x01 \x01(\tR\x04memo\x12\x12\n" +
 	"\x04hash\x18\x02 \x01(\fR\x04hash\x12\x14\n" +
@@ -840,7 +853,8 @@ const file_invoices_proto_rawDesc = "" +
 	"cltvExpiry\x121\n" +
 	"\vroute_hints\x18\b \x03(\v2\x10.lnrpc.RouteHintR\n" +
 	"routeHints\x12\x18\n" +
-	"\aprivate\x18\t \x01(\bR\aprivate\"}\n" +
+	"\aprivate\x18\t \x01(\bR\aprivate\x12*\n" +
+	"\x10payment_metadata\x18\xe8\a \x01(\fR\x0fpaymentMetadata\"}\n" +
 	"\x12AddHoldInvoiceResp\x12'\n" +
 	"\x0fpayment_request\x18\x01 \x01(\tR\x0epaymentRequest\x12\x1b\n" +
 	"\tadd_index\x18\x02 \x01(\x04R\baddIndex\x12!\n" +

@@ -774,6 +774,7 @@ func (q *Quoter) create(ctx context.Context, terms *Quote, who string,
 		CLTVDelta:  terms.CLTVDelta,
 		Expiry:     q.Policy.InvoiceExpiry,
 		Memo:       terms.Description,
+		Metadata:   node.InvoiceMetadata(terms.Outgoing),
 	})
 	if err != nil {
 		// The record exists and the invoice may: a call that failed may

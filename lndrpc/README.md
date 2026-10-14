@@ -22,6 +22,12 @@ blocks are hashed, not the RPC surface. So the same generated client drives the
 BLAKE2b node and the stock LND on Bitcoin, and there is no second set of
 bindings to keep in step.
 
+One field is the exception: `AddHoldInvoiceRequest.payment_metadata` (number
+1000, kept clear of upstream's) in `invoices.proto`, so the hold invoice can
+carry the destination invoice's BOLT 11 `m` field. Stock LND does not know it
+and ignores it, as protobuf ignores any unknown field, so the same client still
+drives both nodes: on Bitcoin the hold invoice is just made without `m`.
+
 `make check-protos` re-verifies that, because it is an assumption rather than a
 guarantee: if the fork ever changes one of these files, a bridge built against
 stale bindings would misread whatever moved.

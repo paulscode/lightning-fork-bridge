@@ -187,6 +187,12 @@ type HoldInvoice struct {
 
 	// Memo is what the payer sees.
 	Memo string
+
+	// Metadata is the destination invoice's payment metadata (BOLT 11 field
+	// m), carried over opaque so the payer reading the hold invoice sees it
+	// too (see InvoiceMetadata). A node that cannot put it on an invoice,
+	// stock LND, leaves it off.
+	Metadata []byte
 }
 
 // PayRequest is what the bridge asks the outgoing node to send.

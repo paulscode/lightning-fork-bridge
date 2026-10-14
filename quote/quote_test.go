@@ -1,6 +1,7 @@
 package quote
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"math"
@@ -951,5 +952,41 @@ func TestARouteBudgetShrunkByThePaceIsRetryable(t *testing.T) {
 	_, err := q.Quote(ctx, "lnbc1originalinvoice")
 	if CodeOf(err) != CodeChainUnmeasured {
 		t.Fatalf("want chain_unmeasured, got %s (%v)", CodeOf(err), err)
+	}
+}
+
+// TestTheDestinationsMetadataReachesTheHoldInvoice: the m field of the invoice
+// being paid is carried onto the hold invoice as it is, so a payer reading the
+// hold invoice sees what the recipient put there. It is opaque: the decoded
+// invoice (hash, amount, CLTV) still comes from the paying node.
+func TestTheDestinationsMetadataReachesTheHoldInvoice(t *testing.T) {
+	ctx := context.Background()
+
+	// BOLT 11's vector with payment metadata 0x01fafaf0.
+	const withM = "lnbc10m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdp9wpshjmt9de6zqmt9w3skgct5vysxjmnnd9jx2mq8q8a04uqsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q2gqqqqqqsgq7hf8he7ecf7n4ffphs6awl9t6676rrclv9ckg3d3ncn7fct63p6s365duk5wrk202cfy3aj5xnnp5gs3vrdvruverwwq7yzhkf5a3xqpd05wjc"
+	in, out := &fakeIn{}, &fakeOut{decoded: decoded()}
+	q, _ := build(t, in, out, 0.01)
+	if _, err := q.Quote(ctx, withM); err != nil {
+		t.Fatal(err)
+	}
+	if in.asked == nil {
+		t.Fatal("no hold invoice was created")
+	}
+	if got := in.asked.Metadata; !bytes.Equal(got, []byte{0x01, 0xfa, 0xfa, 0xf0}) {
+		t.Errorf("hold invoice metadata %x, want 01fafaf0", got)
+	}
+	if in.asked.Hash != hash || in.asked.AmountMsat == 0 {
+		t.Errorf("the metadata changed what is paid: %x, %d", in.asked.Hash,
+			in.asked.AmountMsat)
+	}
+
+	// An invoice with no m field gives a hold invoice with none.
+	in2, out2 := &fakeIn{}, &fakeOut{decoded: decoded()}
+	q2, _ := build(t, in2, out2, 0.01)
+	if _, err := q2.Quote(ctx, "lnbc1originalinvoice"); err != nil {
+		t.Fatal(err)
+	}
+	if in2.asked == nil || in2.asked.Metadata != nil {
+		t.Errorf("metadata out of nowhere: %+v", in2.asked)
 	}
 }
