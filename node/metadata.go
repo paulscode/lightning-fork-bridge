@@ -93,7 +93,9 @@ func bech32Polymod(values []byte) uint32 {
 }
 
 // regroup turns five-bit groups into bytes, dropping the padding bits at the
-// end as BOLT 11 does for byte fields.
+// end as BOLT 11 does for byte fields. Like zpay32 (bech32.ConvertBits without
+// padding), it refuses padding of five bits or more, or padding that is not
+// zero, returning nil, so the two parsers agree on what a field holds.
 func regroup(groups []byte) []byte {
 	var out []byte
 	acc, bits := uint32(0), uint(0)
@@ -104,6 +106,9 @@ func regroup(groups []byte) []byte {
 			bits -= 8
 			out = append(out, byte(acc>>bits))
 		}
+	}
+	if bits >= 5 || acc&(1<<bits-1) != 0 {
+		return nil
 	}
 	return out
 }

@@ -192,11 +192,13 @@ type AddHoldInvoiceRequest struct {
 	RouteHints []*lnrpc.RouteHint `protobuf:"bytes,8,rep,name=route_hints,json=routeHints,proto3" json:"route_hints,omitempty"`
 	// Whether this invoice should include routing hints for private channels.
 	Private bool `protobuf:"varint,9,opt,name=private,proto3" json:"private,omitempty"`
-	// Payment metadata (BOLT 11 field m) to put on the invoice: the payer sends
-	// it back with the payment. Setting it also sets the payment_metadata feature
-	// bit (49), as BOLT 11 asks of an invoice that carries one. Lightning Fork
-	// only: stock LND ignores the field, and the number is kept clear of
-	// upstream's.
+	// Payment metadata (BOLT 11 field m) to put on the invoice: BOLT 11 has the
+	// payer send it back with the payment. Setting it also sets the optional
+	// feature bit 49, BOLT 9's option_payment_metadata, so payers can tell the
+	// invoice expects it back; BOLT 11 itself does not require the bit. Lightning
+	// Fork only: stock LND ignores the field, and the number is kept clear of
+	// upstream's. lnd#10316 proposes metadata = 11 for the same thing; if
+	// upstream takes it, Lightning Fork will move to that field.
 	PaymentMetadata []byte `protobuf:"bytes,1000,opt,name=payment_metadata,json=paymentMetadata,proto3" json:"payment_metadata,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache

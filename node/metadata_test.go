@@ -68,3 +68,25 @@ func indexOf(c byte) int {
 }
 
 func toUpper(s string) string { return string(bytes.ToUpper([]byte(s))) }
+
+// TestRegroupRefusesBadPadding checks that the five-bit-to-byte step refuses
+// what zpay32 refuses: padding that is not zero, or five bits or more of it.
+func TestRegroupRefusesBadPadding(t *testing.T) {
+	// 0x01fafaf0 as BOLT 11 writes it: 7 groups, 3 zero padding bits.
+	good := []byte{0, 7, 29, 15, 21, 28, 0}
+	if got := regroup(good); !bytes.Equal(got, []byte{0x01, 0xfa, 0xfa, 0xf0}) {
+		t.Fatalf("got %x", got)
+	}
+	nonZero := append([]byte(nil), good...)
+	nonZero[6] |= 1 // a padding bit set
+	if got := regroup(nonZero); got != nil {
+		t.Fatalf("non-zero padding gave %x", got)
+	}
+	// 0x01 is two groups (2 padding bits); a third group makes 7.
+	if got := regroup([]byte{0, 4}); !bytes.Equal(got, []byte{0x01}) {
+		t.Fatalf("0x01 gave %x", got)
+	}
+	if got := regroup([]byte{0, 4, 0}); got != nil {
+		t.Fatalf("seven bits of padding gave %x", got)
+	}
+}
