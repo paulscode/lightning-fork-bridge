@@ -634,17 +634,28 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 // The node is asked as well as the journal. Compaction keeps each swap's
 // latest record, finished or not, and this depends on that; but a journal
 // started afresh, or a hash quoted by something else, leaves only the node's
-// invoice to go on, and its HTLCs say whether it was funded.
+// invoice to go on, and its HTLCs say whether it was funded. An expired
+// attempt whose invoice the node no longer has is refused unless it never had
+// one (store.Record.NoInvoice), and one the bridge saw funded
+// (store.Record.HTLCSeen) is refused whatever the node says.
 func (q *Quoter) previous(ctx context.Context, hash node.Hash) (bool, error) {
 	rec, err := q.Store.Get(ctx, hash)
+	expired := false
 	switch {
 	case err == nil:
 		switch rec.State {
 		case swap.Expired:
-			// Ended unpaid, as far as the record knows. The node is
-			// still asked below, because the record could say expired
-			// while the invoice was never cancelled, which must not be
-			// deleted, or while it was funded as it was being cancelled.
+			// Ended unpaid, as far as its state goes. Seen funded, it
+			// was not. Otherwise the node is still asked below, because
+			// the record could say expired while the invoice was never
+			// cancelled, which must not be deleted, or while it was
+			// funded as it was being cancelled.
+			if rec.HTLCSeen {
+				return false, fmt.Errorf("%w: %w: %w: %x expired after "+
+					"an HTLC was seen for it", ErrRefused, ErrDuplicate,
+					ErrFundedBefore, hash)
+			}
+			expired = !rec.NoInvoice
 		case swap.Failed, swap.Aborted:
 			return false, fmt.Errorf("%w: %w: %w: %x was %v", ErrRefused,
 				ErrDuplicate, ErrFundedBefore, hash, rec.State)
@@ -667,6 +678,13 @@ func (q *Quoter) previous(ctx context.Context, hash node.Hash) (bool, error) {
 
 	inv, err := q.In.LookupInvoice(ctx, hash)
 	switch {
+	case errors.Is(err, node.ErrUnknownHash) && expired:
+		// The attempt had an invoice and the node no longer has it, so
+		// whether it was funded cannot be told, and it is taken as
+		// funded.
+		return false, fmt.Errorf("%w: %w: %w: the node no longer has the "+
+			"earlier invoice for %x, so whether it was funded cannot be "+
+			"told", ErrRefused, ErrDuplicate, ErrFundedBefore, hash)
 	case errors.Is(err, node.ErrUnknownHash):
 		return false, nil
 	case err != nil:
@@ -856,6 +874,7 @@ func (q *Quoter) create(ctx context.Context, terms *Quote, who string,
 		Updated:           now,
 		Participant:       who,
 		NoPayAttempt:      true,
+		NoInvoice:         true,
 	}
 	if err := q.Store.Put(ctx, rec); err != nil {
 		return fmt.Errorf("recording the quote: %w", err)
@@ -886,6 +905,7 @@ func (q *Quoter) create(ctx context.Context, terms *Quote, who string,
 		return fmt.Errorf("recording that the invoice exists: %w", err)
 	}
 	rec.State = next
+	rec.NoInvoice = false
 	rec.Updated = q.now()
 	if err := q.Store.Put(ctx, rec); err != nil {
 		// The invoice exists and the record says the swap is only quoted.

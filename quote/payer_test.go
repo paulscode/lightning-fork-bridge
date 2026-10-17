@@ -613,3 +613,79 @@ func TestIdleParticipantsAreForgotten(t *testing.T) {
 		t.Errorf("alice, inside her minute, was not limited: %v", err)
 	}
 }
+
+// TestAnExpiredAttemptTheNodeForgotIsNotQuotedAgain: an attempt that expired
+// with a hold invoice out, whose invoice the node no longer has, cannot be
+// shown unfunded, so it is refused as funded_before. One that never had an
+// invoice can be quoted again, and one the bridge saw an HTLC for is refused
+// whatever the node says.
+func TestAnExpiredAttemptTheNodeForgotIsNotQuotedAgain(t *testing.T) {
+	ctx := context.Background()
+
+	for _, c := range []struct {
+		name      string
+		noInvoice bool
+		htlcSeen  bool
+		node      *node.Invoice
+		requote   bool
+	}{
+		{name: "offered, then gone from the node"},
+		{name: "never offered, nothing on the node", noInvoice: true,
+			requote: true},
+		{name: "seen funded, the node's invoice shows nothing",
+			htlcSeen: true,
+			node:     &node.Invoice{State: node.InvoiceCancelled}},
+		{name: "seen funded, then gone from the node", htlcSeen: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := &fakeIn{}
+			q, st := build(t, in, &fakeOut{decoded: decoded()}, 0.01)
+			if _, err := q.Quote(ctx, "lnbc1x"); err != nil {
+				t.Fatal(err)
+			}
+			rec, _ := st.Get(ctx, hash)
+			rec.State = swap.Expired
+			rec.NoInvoice, rec.HTLCSeen = c.noInvoice, c.htlcSeen
+			if err := st.Put(ctx, rec); err != nil {
+				t.Fatal(err)
+			}
+			in.existing = c.node
+
+			_, err := q.Quote(ctx, "lnbc1x")
+			switch {
+			case c.requote && err != nil:
+				t.Errorf("refused: %v", err)
+			case !c.requote && !errors.Is(err, ErrFundedBefore):
+				t.Errorf("want ErrFundedBefore, got %v", err)
+			}
+		})
+	}
+}
+
+// TestAQuoteSaysWhenItsInvoiceExists: a swap is recorded with no invoice, and
+// the write that records it offered says it has one.
+func TestAQuoteSaysWhenItsInvoiceExists(t *testing.T) {
+	ctx := context.Background()
+
+	in := &fakeIn{addErr: errors.New("node gone")}
+	q, st := build(t, in, &fakeOut{decoded: decoded()}, 0.01)
+	_, _ = q.Quote(ctx, "lnbc1x")
+	if rec, _ := st.Get(ctx, hash); !rec.NoInvoice ||
+		rec.State != swap.Quoted {
+
+		t.Errorf("before its invoice: %v, no invoice %v", rec.State,
+			rec.NoInvoice)
+	}
+
+	in.addErr = nil
+	_ = st.Put(ctx, store.Record{Hash: hash, State: swap.Expired,
+		NoInvoice: true, Created: now})
+	if _, err := q.Quote(ctx, "lnbc1x"); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := st.Get(ctx, hash); rec.NoInvoice ||
+		rec.State != swap.Offered {
+
+		t.Errorf("offered: %v, no invoice %v", rec.State, rec.NoInvoice)
+	}
+}

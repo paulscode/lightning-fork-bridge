@@ -820,3 +820,61 @@ func TestRecordingPayingClearsNoPayAttempt(t *testing.T) {
 		t.Error("funded again, it claims no payment was attempted")
 	}
 }
+
+// TestAnExpiryThatSawAnHTLCSaysSo: a hold invoice the payer funded as it was
+// being cancelled ends expired, unpaid as far as its state goes, and the node
+// may later drop the invoice that shows the HTLC. The record says it was seen
+// funded, so a new quote for the hash can refuse from the record alone.
+func TestAnExpiryThatSawAnHTLCSaysSo(t *testing.T) {
+	ctx := context.Background()
+	in := &fakeIn{invoice: node.Invoice{State: node.InvoiceCancelled,
+		HTLCs: 1}}
+	sw := &Swap{Hash: swapHash, State: swap.Expiring, Created: measured}
+	d, st := recorded(t, in, &fakeOut{}, sw)
+
+	ev, ok, err := d.Resume(ctx, sw)
+	if err != nil || !ok || ev != swap.IncomingCancelled {
+		t.Fatalf("resume: %v %v %v", ev, ok, err)
+	}
+	if _, err := d.Apply(ctx, sw, ev); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Get(ctx, swapHash)
+	if got.State != swap.Expired || !got.HTLCSeen {
+		t.Errorf("recorded %v, HTLC seen %v; want expired and seen",
+			got.State, got.HTLCSeen)
+	}
+
+	// One that lapsed with nothing paid says nothing of the kind.
+	in.invoice.HTLCs = 0
+	sw = &Swap{Hash: swapHash, State: swap.Expiring, Created: measured}
+	d, st = recorded(t, in, &fakeOut{}, sw)
+	ev, _, _ = d.Resume(ctx, sw)
+	if _, err := d.Apply(ctx, sw, ev); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.Get(ctx, swapHash); got.HTLCSeen {
+		t.Error("an unpaid expiry says an HTLC was seen")
+	}
+}
+
+// TestRecordingOfferedClearsNoInvoice: a swap caught up to offered after a
+// crash has an invoice, and says so in the same write.
+func TestRecordingOfferedClearsNoInvoice(t *testing.T) {
+	ctx := context.Background()
+	in := &fakeIn{invoice: node.Invoice{State: node.InvoiceOpen}}
+	sw := &Swap{Hash: swapHash, State: swap.Quoted, NoInvoice: true,
+		Created: measured}
+	d, st := recorded(t, in, &fakeOut{}, sw)
+
+	ev, ok, err := d.Resume(ctx, sw)
+	if err != nil || !ok || ev != swap.InvoiceOffered {
+		t.Fatalf("resume: %v %v %v", ev, ok, err)
+	}
+	if _, err := d.Apply(ctx, sw, ev); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.Get(ctx, swapHash); got.NoInvoice {
+		t.Error("an offered swap says it has no invoice")
+	}
+}

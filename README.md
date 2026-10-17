@@ -240,7 +240,8 @@ share a prefix and both nodes read every one. An invoice whose earlier attempt
 expired before anyone paid it can be quoted again, which deletes the cancelled
 hold invoice first, since a node refuses a second invoice for the same hash;
 one whose earlier attempt was funded is refused as `funded_before`, and the
-recipient has to issue a new invoice. And a
+recipient has to issue a new invoice, as is one whose cancelled hold invoice
+the node no longer has, since nothing then shows it went unpaid. And a
 funded swap that cannot be paid within a grace period of its quote's expiry is
 given back rather than paid late. Refusals carry stable codes, and each
 participant can be limited separately. `docs/payer-api.md` is what a wallet

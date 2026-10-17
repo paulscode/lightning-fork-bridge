@@ -221,6 +221,12 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 
 		return 0, false, fmt.Errorf("reading the incoming invoice: %w", err)
 	}
+	if inv.HTLCs > 0 {
+		// Funded, at least in part, at some point. Recorded with the
+		// next transition, so a swap that ends unpaid as far as its
+		// state goes still says so; the node may not keep the invoice.
+		sw.HTLCSeen = true
+	}
 
 	switch sw.State {
 	case swap.Quoted:

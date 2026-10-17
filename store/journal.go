@@ -46,6 +46,8 @@ type wire struct {
 	Note      string    `json:"note,omitempty"`
 	Who       string    `json:"participant,omitempty"`
 	NoPay     bool      `json:"no_pay_attempt,omitempty"`
+	NoInvoice bool      `json:"no_invoice,omitempty"`
+	HTLCSeen  bool      `json:"htlc_seen,omitempty"`
 }
 
 func toWire(r Record) wire {
@@ -66,6 +68,8 @@ func toWire(r Record) wire {
 		Note:      r.Note,
 		Who:       r.Participant,
 		NoPay:     r.NoPayAttempt,
+		NoInvoice: r.NoInvoice,
+		HTLCSeen:  r.HTLCSeen,
 	}
 	var zeroPre node.Preimage
 	if r.Preimage != zeroPre {
@@ -148,6 +152,8 @@ func (w wire) record() (Record, error) {
 	r.Note = w.Note
 	r.Participant = w.Who
 	r.NoPayAttempt = w.NoPay
+	r.NoInvoice = w.NoInvoice
+	r.HTLCSeen = w.HTLCSeen
 
 	return r, nil
 }

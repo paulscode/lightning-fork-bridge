@@ -139,6 +139,17 @@ type Record struct {
 	// is none. A record without it, written before it existed or by hand,
 	// may have paid, and the paying node is asked as before.
 	NoPayAttempt bool
+
+	// NoInvoice is set when the swap is created and cleared in the same
+	// write that records it Offered, once its hold invoice exists. A swap
+	// that ended with it still set never had an invoice anyone could fund.
+	// A record without it, written before it existed or by hand, may have.
+	NoInvoice bool
+
+	// HTLCSeen is set once the incoming node has been seen holding, or
+	// having held, an HTLC for the hold invoice: the swap was funded, at
+	// least in part, whatever state it ended in. Once set it stays set.
+	HTLCSeen bool
 }
 
 // Valid reports whether a record can be stored. It is deliberately narrow:

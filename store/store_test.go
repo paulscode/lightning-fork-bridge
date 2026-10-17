@@ -1281,3 +1281,36 @@ func TestNoPayAttemptSurvivesTheJournal(t *testing.T) {
 		}
 	}
 }
+
+// TestTheInvoiceFlagsSurviveTheJournal: whether a swap ever had an invoice,
+// and whether it was seen funded, decide a later quote for its hash, so both
+// survive a restart.
+func TestTheInvoiceFlagsSurviveTheJournal(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "swaps.journal")
+
+	j := open(t, path)
+	none := rec(1, swap.Expired)
+	none.NoInvoice = true
+	seen := rec(2, swap.Expired)
+	seen.HTLCSeen = true
+	for _, r := range []Record{none, seen} {
+		if err := j.Put(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	j = open(t, path)
+	defer j.Close()
+	if got, _ := j.Get(ctx, none.Hash); !got.NoInvoice || got.HTLCSeen {
+		t.Errorf("no invoice %v, seen %v; want true, false", got.NoInvoice,
+			got.HTLCSeen)
+	}
+	if got, _ := j.Get(ctx, seen.Hash); got.NoInvoice || !got.HTLCSeen {
+		t.Errorf("no invoice %v, seen %v; want false, true", got.NoInvoice,
+			got.HTLCSeen)
+	}
+}

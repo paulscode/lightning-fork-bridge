@@ -216,8 +216,11 @@ allowed: the bridge deletes the cancelled hold invoice and starts afresh. Once
 a hold invoice for the hash has been paid, the hash is never quoted again, even
 though the attempt ended and the payment came back (`failed`, `aborted`, or
 `expired` with a payment that arrived as it was being cancelled): the answer is
-`funded_before`, and the recipient has to issue a new invoice. While one is
-live the answer is `in_progress`; once one has settled it is `already_paid`.
+`funded_before`, and the recipient has to issue a new invoice. The same
+answer is given when the bridge can no longer show that an expired attempt
+went unpaid, because the node has since deleted its cancelled hold invoice.
+While one is live the answer is `in_progress`; once one has settled it is
+`already_paid`.
 
 ## 5. Limits per participant
 

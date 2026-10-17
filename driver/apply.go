@@ -43,7 +43,11 @@ func (d *Driver) Apply(ctx context.Context, sw *Swap, e swap.Event) (swap.Action
 	before := *sw
 	sw.State = next
 	sw.Updated = d.now()
-	if next == swap.Paying {
+	switch next {
+	case swap.Offered:
+		// The hold invoice exists, and could be funded.
+		sw.NoInvoice = false
+	case swap.Paying:
 		// From this write on a payment may have left, and every cancel
 		// has to ask the paying node first.
 		sw.NoPayAttempt = false
