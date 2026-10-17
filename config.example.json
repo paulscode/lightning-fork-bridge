@@ -48,14 +48,30 @@
     {
       "name": "venue-a",
       "url": "https://example.invalid/api/ticker/BTCB2_BTC",
-      "field": "last"
+      "field": "last",
+      "timeField": "computedAt"
     },
     {
       "name": "venue-b",
       "url": "https://example2.invalid/v1/price",
-      "field": "data.price"
+      "field": "data.price",
+      "maxUnchanged": 3600000000000
     }
   ],
+  "crossCheck": {
+    "name": "venue-a-usd",
+    "incomingUSD": {
+      "name": "venue-a-btcb2-usd",
+      "url": "https://example.invalid/api/ticker/BTCB2_USDC",
+      "field": "last",
+      "timeField": "computedAt"
+    },
+    "outgoingUSD": {
+      "name": "btc-usd",
+      "url": "https://example3.invalid/v1/btc-usd",
+      "field": "usd"
+    }
+  },
   "toBitcoin": {
     "enabled": true,
     "policy": {

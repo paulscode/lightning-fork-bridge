@@ -90,6 +90,11 @@ type Service struct {
 	price    rate.Reading
 	priceErr error
 
+	// unchanged is, per source with no time of its own, the last price it
+	// answered and since when, for refusing a static one.
+	staticMu  sync.Mutex
+	unchanged map[string]unchanged
+
 	// ctx is the service's own lifetime, which a swap driven from an HTTP
 	// request must outlive: the user may disconnect the moment after they
 	// pay, and the HTLC does not go away with their connection.

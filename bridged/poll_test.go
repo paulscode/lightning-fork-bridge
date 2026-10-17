@@ -2,10 +2,12 @@ package bridged
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -74,7 +76,7 @@ func TestFetchPrice(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := fetchPrice(context.Background(), RateSource{
+			got, _, err := fetchPrice(context.Background(), RateSource{
 				Name: "test", URL: serving(t, test.status, test.body),
 				Field: test.field,
 			})
@@ -111,7 +113,7 @@ func TestFetchPriceIsBounded(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = fetchPrice(context.Background(), RateSource{
+		_, _, _ = fetchPrice(context.Background(), RateSource{
 			Name: "flood", URL: srv.URL, Field: "price",
 		})
 	}()
@@ -130,6 +132,7 @@ func TestSamplePriceDropsAFailedSourceRatherThanInventingOne(t *testing.T) {
 	t.Parallel()
 
 	good := serving(t, 200, `{"price": 0.0031}`)
+	alsoGood := serving(t, 200, `{"price": 0.0031}`)
 	bad := serving(t, 500, `down`)
 
 	oracle, err := rate.New(rate.DefaultPolicy)
@@ -139,6 +142,7 @@ func TestSamplePriceDropsAFailedSourceRatherThanInventingOne(t *testing.T) {
 
 	s := &Service{log: quiet(), oracle: oracle, cfg: Config{RateSources: []RateSource{
 		{Name: "good", URL: good, Field: "price"},
+		{Name: "also good", URL: alsoGood, Field: "price"},
 		{Name: "bad", URL: bad, Field: "price"},
 	}}}
 	s.priceErr = fmt.Errorf("none yet")
@@ -150,10 +154,10 @@ func TestSamplePriceDropsAFailedSourceRatherThanInventingOne(t *testing.T) {
 	s.priceMu.RUnlock()
 
 	if gotErr != nil {
-		t.Fatalf("one good source should still price: %v", gotErr)
+		t.Fatalf("two good sources should still price: %v", gotErr)
 	}
-	if got.Sources != 1 {
-		t.Errorf("counted %d sources, wanted only the one that answered",
+	if got.Sources != 2 {
+		t.Errorf("counted %d sources, wanted only the two that answered",
 			got.Sources)
 	}
 	if got.OutgoingPerIncoming != 0.0031 {
@@ -302,5 +306,177 @@ func TestResumeWithNothingPendingIsQuiet(t *testing.T) {
 
 	if err := s.resume(context.Background()); err != nil {
 		t.Errorf("an empty journal should resume cleanly: %v", err)
+	}
+}
+
+// samplingWith is a service pricing from the given sources.
+func samplingWith(t *testing.T, cc *CrossCheck, srcs ...RateSource) *Service {
+	t.Helper()
+
+	oracle, err := rate.New(rate.DefaultPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Service{log: quiet(), oracle: oracle, cfg: Config{
+		RateSources: srcs, CrossCheck: cc,
+	}}
+	s.priceErr = fmt.Errorf("none yet")
+
+	return s
+}
+
+func sampled(s *Service) (rate.Reading, error) {
+	s.priceMu.RLock()
+	defer s.priceMu.RUnlock()
+
+	return s.price, s.priceErr
+}
+
+// TestOneSourceIsNotAPrice: with one source answering there is nothing to
+// check it against, which on a thin market is the oracle's one defence, so
+// the price is refused rather than quoted unchecked.
+func TestOneSourceIsNotAPrice(t *testing.T) {
+	t.Parallel()
+
+	s := samplingWith(t, nil,
+		RateSource{Name: "good", URL: serving(t, 200, `{"price": 0.0031}`),
+			Field: "price"},
+		RateSource{Name: "bad", URL: serving(t, 500, `down`),
+			Field: "price"},
+	)
+	s.samplePrice(context.Background())
+
+	if _, err := sampled(s); !errors.Is(err, rate.ErrStale) {
+		t.Fatalf("one answering source priced: %v", err)
+	}
+}
+
+// TestASourcesOwnTimeIsHowOldItsPriceIs: a source that says when it worked the
+// price out is as old as it says, not as old as the fetch, and one that stops
+// saying is refused. A frozen ticker served fresh is the failure this exists
+// for.
+func TestASourcesOwnTimeIsHowOldItsPriceIs(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	fresh := fmt.Sprintf(`{"price": 0.0031, "at": %d}`, now.UnixMilli())
+	frozen := fmt.Sprintf(`{"price": 0.0031, "at": %d}`,
+		now.Add(-time.Hour).Unix())
+	rfc := fmt.Sprintf(`{"price": 0.0031, "at": %q}`,
+		now.UTC().Format(time.RFC3339))
+
+	for _, c := range []struct {
+		name  string
+		body  string
+		price bool
+	}{
+		{"fresh, in milliseconds", fresh, true},
+		{"fresh, in RFC 3339", rfc, true},
+		{"an hour old", frozen, false},
+		{"no time at all", `{"price": 0.0031}`, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := samplingWith(t, nil,
+				RateSource{Name: "timed", URL: serving(t, 200, c.body),
+					Field: "price", TimeField: "at"},
+				RateSource{Name: "other",
+					URL:   serving(t, 200, `{"price": 0.0031}`),
+					Field: "price"},
+			)
+			s.samplePrice(context.Background())
+
+			_, err := sampled(s)
+			if c.price && err != nil {
+				t.Errorf("refused: %v", err)
+			}
+			if !c.price && !errors.Is(err, rate.ErrStale) {
+				t.Errorf("want a stale refusal, got %v", err)
+			}
+		})
+	}
+}
+
+// TestAStaticPriceHasAMaximumAge: a source with no time of its own that keeps
+// answering the very same price, a cache or a frozen ticker, is refused once
+// it has done so for longer than its maxUnchanged, and accepted again when
+// the price moves.
+func TestAStaticPriceHasAMaximumAge(t *testing.T) {
+	t.Parallel()
+
+	var price atomic.Value
+	price.Store("0.0031")
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = fmt.Fprintf(w, `{"price": %s}`, price.Load())
+		}))
+	t.Cleanup(srv.Close)
+
+	static := RateSource{Name: "static", URL: srv.URL, Field: "price",
+		MaxUnchanged: 50 * time.Millisecond}
+	s := samplingWith(t, nil, static, RateSource{Name: "other",
+		URL: serving(t, 200, `{"price": 0.0031}`), Field: "price"})
+
+	s.samplePrice(context.Background())
+	if _, err := sampled(s); err != nil {
+		t.Fatalf("a price just read was refused: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	s.samplePrice(context.Background())
+	if _, err := sampled(s); !errors.Is(err, rate.ErrStale) {
+		t.Fatalf("a price that has not moved past its maxUnchanged: %v",
+			err)
+	}
+
+	price.Store("0.00311")
+	s.samplePrice(context.Background())
+	if _, err := sampled(s); err != nil {
+		t.Errorf("a price that moved was refused: %v", err)
+	}
+}
+
+// TestTheCrossCheckIsDerivedFromDollars: BTCB2 in dollars over BTC in dollars
+// is a reading of BTCB2 in BTC, checked against the direct one: agreeing, it
+// is a second source; disagreeing, the price is refused.
+func TestTheCrossCheckIsDerivedFromDollars(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range []struct {
+		name   string
+		b2bUSD string
+		agrees bool
+	}{
+		// 0.0031 BTC at 100,000 dollars is 310 dollars.
+		{"agreeing", "310", true},
+		{"ten percent apart", "341", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			cc := &CrossCheck{
+				Name: "usd",
+				IncomingUSD: RateSource{Name: "btcb2-usd",
+					URL:   serving(t, 200, `{"p": "`+c.b2bUSD+`"}`),
+					Field: "p"},
+				OutgoingUSD: RateSource{Name: "btc-usd",
+					URL: serving(t, 200, `{"p": 100000}`), Field: "p"},
+			}
+			s := samplingWith(t, cc, RateSource{Name: "direct",
+				URL: serving(t, 200, `{"price": 0.0031}`), Field: "price"})
+			s.samplePrice(context.Background())
+
+			got, err := sampled(s)
+			switch {
+			case c.agrees && err != nil:
+				t.Errorf("refused: %v", err)
+			case c.agrees && got.Sources != 2:
+				t.Errorf("%d sources, want the direct one and the "+
+					"cross-check", got.Sources)
+			case !c.agrees && !errors.Is(err, rate.ErrDisagreement):
+				t.Errorf("want a disagreement, got %v", err)
+			}
+		})
 	}
 }

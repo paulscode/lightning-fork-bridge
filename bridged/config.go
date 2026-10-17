@@ -137,10 +137,21 @@ type Config struct {
 	// Rate is how the price is combined and when to stop trusting it.
 	Rate rate.Policy `json:"rate"`
 
-	// RateSources are where the price comes from. At least one is required
-	// and there is no fallback: a bridge that invents a rate when its
-	// sources are down is a bridge that pays out at a price nobody quoted.
+	// RateSources are where the price comes from. There is no fallback: a
+	// bridge that invents a rate when its sources are down is a bridge that
+	// pays out at a price nobody quoted.
+	//
+	// Two independent readings are required, counting CrossCheck as one,
+	// and two have to answer for a price to be quoted at all: the oracle's
+	// one defence on a thin market is readings that should agree being
+	// checked against each other, and one source has nothing to be checked
+	// against.
 	RateSources []RateSource `json:"rateSources"`
+
+	// CrossCheck, when set, is one more reading of the price, derived from
+	// two dollar prices with rate.Derive: a second opinion on a direct
+	// BTCB2/BTC price from a different part of the book.
+	CrossCheck *CrossCheck `json:"crossCheck,omitempty"`
 
 	// PollInterval is how often the chain and price observers refresh.
 	// Zero means thirty seconds.
@@ -165,6 +176,34 @@ type RateSource struct {
 	// units one incoming unit buys in the BLAKE2b-to-Bitcoin direction. The
 	// reverse direction inverts it. Dotted paths index nested objects.
 	Field string `json:"field"`
+
+	// TimeField is the JSON field holding when the source worked the price
+	// out, where it says: seconds or milliseconds since 1970, or an RFC
+	// 3339 time. The reading is then as old as the source says, not as old
+	// as the fetch, and the rate policy's maxAge applies to that. A reply
+	// without it is refused, since a source that stopped saying when is
+	// one that may have stopped computing.
+	TimeField string `json:"timeField,omitempty"`
+
+	// MaxUnchanged applies to a source with no TimeField: how long it may
+	// answer the very same price before that price is taken for a static
+	// one, cached or frozen, and refused until it moves. Zero means
+	// DefaultMaxUnchanged.
+	MaxUnchanged time.Duration `json:"maxUnchanged,omitempty"`
+}
+
+// DefaultMaxUnchanged is RateSource.MaxUnchanged when none is set. A venue's
+// own clock is the better evidence, where it gives one; without it, an hour
+// of a price that has not moved by a single digit is long for a market and
+// short for a cache.
+const DefaultMaxUnchanged = time.Hour
+
+func (s RateSource) maxUnchanged() time.Duration {
+	if s.MaxUnchanged > 0 {
+		return s.MaxUnchanged
+	}
+
+	return DefaultMaxUnchanged
 }
 
 func (s RateSource) valid() error {
@@ -176,6 +215,86 @@ func (s RateSource) valid() error {
 	case s.Field == "":
 		return fmt.Errorf("%w: rate source %q names no field", ErrConfig,
 			s.Name)
+	case s.MaxUnchanged < 0:
+		return fmt.Errorf("%w: rate source %q has a negative maxUnchanged",
+			ErrConfig, s.Name)
+	}
+
+	return nil
+}
+
+// CrossCheck is a reading of the price derived from two dollar prices: the
+// incoming asset's and the outgoing asset's, BTCB2 and BTC, whose ratio is the
+// BTCB2/BTC price the sources quote.
+type CrossCheck struct {
+	// Name is what to call it in logs and in a disagreement.
+	Name string `json:"name"`
+
+	// IncomingUSD is dollars per BTCB2, OutgoingUSD dollars per BTC. Each
+	// is read as a rate source, timestamps and all.
+	IncomingUSD RateSource `json:"incomingUSD"`
+	OutgoingUSD RateSource `json:"outgoingUSD"`
+}
+
+func (c CrossCheck) valid() error {
+	if c.Name == "" {
+		return fmt.Errorf("%w: the cross-check has no name", ErrConfig)
+	}
+	if err := c.IncomingUSD.valid(); err != nil {
+		return err
+	}
+	if err := c.OutgoingUSD.valid(); err != nil {
+		return err
+	}
+	if c.IncomingUSD.URL == c.OutgoingUSD.URL &&
+		c.IncomingUSD.Field == c.OutgoingUSD.Field {
+
+		return fmt.Errorf("%w: the cross-check reads both of its prices "+
+			"from the same place", ErrConfig)
+	}
+
+	return nil
+}
+
+// sources checks the price sources: at least two independent readings,
+// counting the cross-check as one, each named once and fetched from its own
+// URL.
+func (c Config) sources() error {
+	n := len(c.RateSources)
+	if c.CrossCheck != nil {
+		n++
+	}
+	if n < 2 {
+		return fmt.Errorf("%w: %d price sources, and two are needed, "+
+			"counting crossCheck as one. There is no default: a bridge "+
+			"that invents a price pays out at one nobody quoted, and one "+
+			"that trusts a single source has nothing to check it "+
+			"against", ErrConfig, n)
+	}
+
+	names, urls := map[string]bool{}, map[string]bool{}
+	for _, s := range c.RateSources {
+		if err := s.valid(); err != nil {
+			return err
+		}
+		if names[s.Name] {
+			return fmt.Errorf("%w: two price sources are called %q",
+				ErrConfig, s.Name)
+		}
+		if urls[s.URL] {
+			return fmt.Errorf("%w: two price sources read %s, which is "+
+				"one source and not two", ErrConfig, s.URL)
+		}
+		names[s.Name], urls[s.URL] = true, true
+	}
+	if c.CrossCheck != nil {
+		if err := c.CrossCheck.valid(); err != nil {
+			return err
+		}
+		if names[c.CrossCheck.Name] {
+			return fmt.Errorf("%w: the cross-check and a price source are "+
+				"both called %q", ErrConfig, c.CrossCheck.Name)
+		}
 	}
 
 	return nil
@@ -257,15 +376,8 @@ func (c Config) Valid() error {
 	if !c.Rate.Valid() {
 		return fmt.Errorf("%w: the rate policy is not usable", ErrConfig)
 	}
-	if len(c.RateSources) == 0 {
-		return fmt.Errorf("%w: no rate sources, and there is no default: a "+
-			"bridge that invents a price pays out at one nobody quoted",
-			ErrConfig)
-	}
-	for _, s := range c.RateSources {
-		if err := s.valid(); err != nil {
-			return err
-		}
+	if err := c.sources(); err != nil {
+		return err
 	}
 	if err := c.ToBitcoin.valid("toBitcoin"); err != nil {
 		return err

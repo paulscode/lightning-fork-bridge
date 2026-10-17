@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -249,12 +250,16 @@ func (s *Service) pollPrice(ctx context.Context) {
 	}
 }
 
+// MinPriceSources is how many readings must answer, fresh, for a price to be
+// quoted: one to be checked against the other.
+const MinPriceSources = 2
+
 // samplePrice reads every source and combines them.
 //
 // A source that fails is left out rather than defaulted: the oracle's whole
 // job is to notice when sources disagree, and a made-up number that agrees
-// with everything defeats it. If that leaves too few, the oracle refuses and
-// the refusal is what quotes see.
+// with everything defeats it. If that leaves fewer than MinPriceSources, the
+// price is refused, and the refusal is what quotes see.
 func (s *Service) samplePrice(ctx context.Context) {
 	// Same reasoning as sampleChain: New always builds the oracle, so a
 	// missing one is a programming error, and a background goroutine is
@@ -265,9 +270,9 @@ func (s *Service) samplePrice(ctx context.Context) {
 		return
 	}
 
-	obs := make([]rate.Observation, 0, len(s.cfg.RateSources))
+	obs := make([]rate.Observation, 0, len(s.cfg.RateSources)+1)
 	for _, src := range s.cfg.RateSources {
-		price, err := fetchPrice(ctx, src)
+		price, at, err := s.readSource(ctx, src)
 		if err != nil {
 			s.log.Warn("a rate source failed", "source", src.Name,
 				"err", err)
@@ -275,11 +280,36 @@ func (s *Service) samplePrice(ctx context.Context) {
 			continue
 		}
 		obs = append(obs, rate.Observation{
-			Source: src.Name, OutgoingPerIncoming: price, At: time.Now(),
+			Source: src.Name, OutgoingPerIncoming: price, At: at,
 		})
 	}
+	if cc := s.cfg.CrossCheck; cc != nil {
+		o, err := s.crossCheck(ctx, *cc)
+		if err != nil {
+			s.log.Warn("the cross-check failed", "source", cc.Name,
+				"err", err)
+		} else {
+			obs = append(obs, o)
+		}
+	}
 
-	reading, err := s.oracle.Update(time.Now(), obs)
+	var reading rate.Reading
+	var err error
+	if len(obs) < MinPriceSources {
+		err = fmt.Errorf("%w: %d of the price sources answered, and %d "+
+			"are needed to check one against another", rate.ErrStale,
+			len(obs), MinPriceSources)
+	} else {
+		reading, err = s.oracle.Update(time.Now(), obs)
+		if err == nil && reading.Sources < MinPriceSources {
+			// The oracle drops a reading older than its maxAge, by
+			// the source's own clock where it gives one.
+			err = fmt.Errorf("%w: %d of the price sources are recent "+
+				"enough, and %d are needed to check one against "+
+				"another", rate.ErrStale, reading.Sources,
+				MinPriceSources)
+		}
+	}
 
 	s.priceMu.Lock()
 	if err != nil {
@@ -298,6 +328,71 @@ func (s *Service) samplePrice(ctx context.Context) {
 		"sources", reading.Sources, "spread", reading.Spread)
 }
 
+// readSource reads one source and says when its price is from: the source's
+// own time where it gives one, and otherwise now, unless it has answered the
+// very same price for longer than its MaxUnchanged, which is refused as a
+// static price.
+func (s *Service) readSource(ctx context.Context, src RateSource) (float64,
+	time.Time, error) {
+
+	price, at, err := fetchPrice(ctx, src)
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	if src.TimeField != "" {
+		return price, at, nil
+	}
+
+	now := time.Now()
+	s.staticMu.Lock()
+	defer s.staticMu.Unlock()
+	if s.unchanged == nil {
+		s.unchanged = map[string]unchanged{}
+	}
+	u, ok := s.unchanged[src.Name]
+	if !ok || u.price != price {
+		u = unchanged{price: price, since: now}
+		s.unchanged[src.Name] = u
+	}
+	if held := now.Sub(u.since); held > src.maxUnchanged() {
+		return 0, time.Time{}, fmt.Errorf("%w: %s has answered %g for %v, "+
+			"longer than the %v a price may stand still before it is "+
+			"taken for a static one", rate.ErrStale, src.Name, price,
+			held.Round(time.Second), src.maxUnchanged())
+	}
+
+	return price, now, nil
+}
+
+// unchanged is a source's last price and since when it has been answering it.
+type unchanged struct {
+	price float64
+	since time.Time
+}
+
+// crossCheck derives a reading from the cross-check's two dollar prices. It is
+// as old as the older of the two.
+func (s *Service) crossCheck(ctx context.Context, cc CrossCheck) (
+	rate.Observation, error) {
+
+	in, inAt, err := s.readSource(ctx, cc.IncomingUSD)
+	if err != nil {
+		return rate.Observation{}, fmt.Errorf("%s: %w", cc.IncomingUSD.Name,
+			err)
+	}
+	out, outAt, err := s.readSource(ctx, cc.OutgoingUSD)
+	if err != nil {
+		return rate.Observation{}, fmt.Errorf("%s: %w", cc.OutgoingUSD.Name,
+			err)
+	}
+	at := inAt
+	if outAt.Before(at) {
+		at = outAt
+	}
+
+	return rate.Derive(cc.Name, in, out, at)
+}
+
 // priceClient fetches prices. Redirects are refused rather than followed: the
 // URL is the operator's choice, and a source that answers with a redirect has
 // stopped being the thing they configured.
@@ -308,55 +403,117 @@ var priceClient = &http.Client{
 	},
 }
 
-// fetchPrice reads one source.
-func fetchPrice(ctx context.Context, src RateSource) (float64, error) {
+// fetchPrice reads one source: the price, and when the source says it worked
+// it out, which is zero for a source with no TimeField.
+func fetchPrice(ctx context.Context, src RateSource) (float64, time.Time,
+	error) {
+
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.URL, nil)
 	if err != nil {
-		return 0, err
+		return 0, time.Time{}, err
 	}
 	resp, err := priceClient.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, time.Time{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("%s answered %s", src.URL, resp.Status)
+		return 0, time.Time{}, fmt.Errorf("%s answered %s", src.URL,
+			resp.Status)
 	}
 
 	// Bounded: a source that streams forever must not take the daemon with
 	// it, and a price is a few hundred bytes.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return 0, err
+		return 0, time.Time{}, err
 	}
 
 	var doc any
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return 0, fmt.Errorf("%s did not return JSON: %w", src.URL, err)
+		return 0, time.Time{}, fmt.Errorf("%s did not return JSON: %w",
+			src.URL, err)
 	}
 
-	return extract(doc, src.Field)
+	price, err := extract(doc, src.Field)
+	if err != nil || src.TimeField == "" {
+		return price, time.Time{}, err
+	}
+
+	at, err := extractTime(doc, src.TimeField)
+	if err != nil {
+		// Read as stale rather than as unreadable: a source that stops
+		// saying when may have stopped computing.
+		return 0, time.Time{}, fmt.Errorf("%w: %s gave no usable time: %w",
+			rate.ErrStale, src.Name, err)
+	}
+
+	return price, at, nil
+}
+
+// extractTime reads a time: seconds or milliseconds since 1970, as a number
+// or a string, or an RFC 3339 string. A count past 10^12 is milliseconds,
+// which as seconds would be tens of thousands of years from now.
+func extractTime(doc any, path string) (time.Time, error) {
+	cur, err := walk(doc, path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if str, ok := cur.(string); ok {
+		if t, err := time.Parse(time.RFC3339Nano, str); err == nil {
+			return t, nil
+		}
+	}
+
+	n, err := number(cur, path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if n <= 0 || math.IsInf(n, 0) || math.IsNaN(n) {
+		return time.Time{}, fmt.Errorf("%q holds %v, which is not a time",
+			path, cur)
+	}
+	if n > 1e12 {
+		return time.UnixMilli(int64(n)), nil
+	}
+
+	return time.Unix(int64(n), 0), nil
+}
+
+// walk follows a dotted path through nested objects.
+func walk(doc any, path string) (any, error) {
+	cur := doc
+	for _, part := range strings.Split(path, ".") {
+		obj, ok := cur.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%q: %s is not an object", path, part)
+		}
+		cur, ok = obj[part]
+		if !ok {
+			return nil, fmt.Errorf("%q: no field %s", path, part)
+		}
+	}
+
+	return cur, nil
 }
 
 // extract walks a dotted path and reads a number, which JSON may have encoded
 // as a string.
 func extract(doc any, path string) (float64, error) {
-	cur := doc
-	for _, part := range strings.Split(path, ".") {
-		obj, ok := cur.(map[string]any)
-		if !ok {
-			return 0, fmt.Errorf("%q: %s is not an object", path, part)
-		}
-		cur, ok = obj[part]
-		if !ok {
-			return 0, fmt.Errorf("%q: no field %s", path, part)
-		}
+	cur, err := walk(doc, path)
+	if err != nil {
+		return 0, err
 	}
 
+	return number(cur, path)
+}
+
+// number reads a JSON number, or a string holding one.
+func number(cur any, path string) (float64, error) {
 	switch v := cur.(type) {
 	case float64:
 		return v, nil

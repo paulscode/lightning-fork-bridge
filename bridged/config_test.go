@@ -34,7 +34,10 @@ const good = `{
     "breakerWindow": 600000000000, "cooldown": 1800000000000,
     "baseSpread": 0.01, "volatilityMultiple": 2, "maxSpread": 0.05
   },
-  "rateSources": [{"name": "venue", "url": "https://x/p", "field": "price"}],
+  "rateSources": [
+    {"name": "venue", "url": "https://x/p", "field": "price"},
+    {"name": "other", "url": "https://y/p", "field": "price"}
+  ],
   "toBitcoin": {
     "enabled": true,
     "policy": {
@@ -99,11 +102,35 @@ func TestRefusals(t *testing.T) {
 		{
 			name: "no rate source",
 			edit: func(s string) string {
-				return strings.Replace(s,
-					`[{"name": "venue", "url": "https://x/p", "field": "price"}]`,
-					`[]`, 1)
+				return strings.Replace(s, `"rateSources": [`,
+					`"unused": [`, 1)
 			},
-			want: "no rate sources",
+			want: "unknown field",
+		},
+		{
+			// One source has nothing to be checked against.
+			name: "one rate source",
+			edit: func(s string) string {
+				return strings.Replace(s,
+					`{"name": "venue", "url": "https://x/p", "field": "price"},`,
+					``, 1)
+			},
+			want: "two are needed",
+		},
+		{
+			name: "one source twice",
+			edit: func(s string) string {
+				return strings.Replace(s, `"https://y/p"`, `"https://x/p"`, 1)
+			},
+			want: "one source and not two",
+		},
+		{
+			name: "one name twice",
+			edit: func(s string) string {
+				return strings.Replace(s, `"name": "other"`,
+					`"name": "venue"`, 1)
+			},
+			want: "two price sources are called",
 		},
 		{
 			name: "no direction enabled",
@@ -391,5 +418,38 @@ func TestTheExampleConfigurationLoads(t *testing.T) {
 	if cfg.Margin.HoldExpiryDelta != margin.DefaultHoldExpiryDelta {
 		t.Errorf("the example's hold expiry delta is %d",
 			cfg.Margin.HoldExpiryDelta)
+	}
+}
+
+// TestACrossCheckCountsAsASource: one direct source and a cross-check derived
+// from two dollar prices are two independent readings.
+func TestACrossCheckCountsAsASource(t *testing.T) {
+	t.Parallel()
+
+	one := strings.Replace(good,
+		`{"name": "venue", "url": "https://x/p", "field": "price"},`, ``, 1)
+	withCross := strings.Replace(one, `"rateSources"`, `"crossCheck": {
+    "name": "usd",
+    "incomingUSD": {"name": "btcb2-usd", "url": "https://z/b", "field": "p"},
+    "outgoingUSD": {"name": "btc-usd", "url": "https://z/c", "field": "p",
+      "timeField": "at"}
+  },
+  "rateSources"`, 1)
+
+	cfg, err := load(t, withCross)
+	if err != nil {
+		t.Fatalf("a source and a cross-check should load: %v", err)
+	}
+	if cfg.CrossCheck == nil ||
+		cfg.CrossCheck.OutgoingUSD.TimeField != "at" {
+
+		t.Errorf("the cross-check did not load: %+v", cfg.CrossCheck)
+	}
+
+	// Both of its prices from the same place is no cross-check.
+	same := strings.Replace(withCross, `"https://z/c", "field": "p"`,
+		`"https://z/b", "field": "p"`, 1)
+	if _, err := load(t, same); !errors.Is(err, ErrConfig) {
+		t.Errorf("a cross-check reading one price twice loaded: %v", err)
 	}
 }
