@@ -181,7 +181,8 @@ type Config struct {
 
 // RateSource is one place to read the price from.
 type RateSource struct {
-	// Name is what to call it in logs and in a disagreement.
+	// Name is what to call it in logs and in a disagreement. Names are
+	// unique across the rate sources, the cross-check and its two prices.
 	Name string `json:"name"`
 
 	// URL is fetched and expected to return JSON.
@@ -330,9 +331,17 @@ func (c Config) sources() error {
 		if err := c.CrossCheck.valid(); err != nil {
 			return err
 		}
-		if names[c.CrossCheck.Name] {
-			return fmt.Errorf("%w: the cross-check and a price source are "+
-				"both called %q", ErrConfig, c.CrossCheck.Name)
+		// The unchanged-price check keys on these names, so the
+		// cross-check's two prices need names of their own too.
+		for _, n := range []string{c.CrossCheck.Name,
+			c.CrossCheck.IncomingUSD.Name, c.CrossCheck.OutgoingUSD.Name} {
+
+			if names[n] {
+				return fmt.Errorf("%w: two price sources, counting the "+
+					"cross-check and its two prices, are called %q",
+					ErrConfig, n)
+			}
+			names[n] = true
 		}
 	}
 	if v := c.venues(); len(v) < MinPriceVenues {

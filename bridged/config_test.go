@@ -465,6 +465,22 @@ func TestACrossCheckCountsAsASource(t *testing.T) {
 		t.Errorf("the cross-check did not load: %+v", cfg.CrossCheck)
 	}
 
+	// Names are unique across the sources, the cross-check and its two
+	// prices: the unchanged-price check is kept by name.
+	for _, clash := range []struct{ from, to string }{
+		{`"name": "btcb2-usd"`, `"name": "other"`},
+		{`"name": "btc-usd"`, `"name": "btcb2-usd"`},
+		{`"name": "usd"`, `"name": "btc-usd"`},
+	} {
+		_, err := load(t, strings.Replace(withCross, clash.from, clash.to,
+			1))
+		if !errors.Is(err, ErrConfig) ||
+			!strings.Contains(err.Error(), "are called") {
+
+			t.Errorf("%s as %s: %v", clash.from, clash.to, err)
+		}
+	}
+
 	// Both of its prices from the same place is no cross-check.
 	same := strings.Replace(withCross, `"https://z/c", "field": "p"`,
 		`"https://z/b", "field": "p"`, 1)
