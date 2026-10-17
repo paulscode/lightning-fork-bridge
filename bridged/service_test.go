@@ -237,9 +237,12 @@ func TestPricerRefusesToInvertAnUnusableRate(t *testing.T) {
 	}
 }
 
-// The spread has two independent reasons to widen and charging only one of
-// them underprices the other risk.
-func TestSpreadTakesTheWiderOfTheTwo(t *testing.T) {
+// The spread is the inventory policy's for the position, with the market's
+// recent move on top. Both are reasons to charge, and the discount on the
+// replenishing side has to survive: taking the larger of the two, as the
+// pricer once did, never went below the rate policy's base spread, and the
+// discount was never charged.
+func TestSpreadAddsTheMarketsMoveToThePosition(t *testing.T) {
 	t.Parallel()
 
 	inv := inventory.DefaultPolicy
@@ -247,21 +250,45 @@ func TestSpreadTakesTheWiderOfTheTwo(t *testing.T) {
 	inv.FloorOutgoingMsat = 100_000_000
 
 	tests := []struct {
-		name        string
-		volatility  float64
-		heldMsat    uint64
-		wantAtLeast float64
+		name       string
+		volatility float64
+		heldMsat   uint64
+		dir        int
+		want       func(pos float64) bool
 	}{
 		{
-			// Full outgoing side, so inventory is at its floor and the
-			// oracle's wider number has to win.
-			name: "volatility is wider", volatility: 0.025,
-			heldMsat: 1_000_000_000, wantAtLeast: 0.025,
+			// Calm, with the outgoing side full: the base spread.
+			name: "calm and full", heldMsat: 1_000_000_000,
+			want: func(s float64) bool {
+				return math.Abs(s-inv.BaseSpread) < 1e-12
+			},
 		},
 		{
-			// Drained outgoing side with a calm market: inventory wins.
-			name: "inventory is wider", volatility: 0.001,
-			heldMsat: 110_000_000, wantAtLeast: inv.BaseSpread,
+			// The market moved 1%, times the multiple of 2.
+			name: "a moving market", volatility: 0.01,
+			heldMsat: 1_000_000_000,
+			want: func(s float64) bool {
+				return math.Abs(s-(inv.BaseSpread+0.02)) < 1e-12
+			},
+		},
+		{
+			// Capped at the rate policy's maximum.
+			name: "a wild market", volatility: 0.5,
+			heldMsat: 1_000_000_000,
+			want: func(s float64) bool {
+				return math.Abs(s-(inv.BaseSpread+0.05)) < 1e-12
+			},
+		},
+		{
+			// Drained outgoing side with a calm market: wider.
+			name: "drained", heldMsat: 110_000_000,
+			want: func(s float64) bool { return s > inv.BaseSpread },
+		},
+		{
+			// The replenishing side, with BTC running low, is the one
+			// the discount is for.
+			name: "replenishing", heldMsat: 110_000_000, dir: 1,
+			want: func(s float64) bool { return s < inv.BaseSpread },
 		},
 	}
 
@@ -270,21 +297,23 @@ func TestSpreadTakesTheWiderOfTheTwo(t *testing.T) {
 			t.Parallel()
 
 			held := test.heldMsat
-			s := testService(t, &fakeOut{accepts: "lnbc"}, nil,
-				func(context.Context) (uint64, error) { return held, nil })
+			bal := func(context.Context) (uint64, error) { return held, nil }
+			s := testService(t, &fakeOut{accepts: "lnbc"},
+				&fakeOut{accepts: "lnblake"}, bal)
+			s.cfg.Rate = rate.Policy{VolatilityMultiple: 2, MaxSpread: 0.05}
 			s.price = rate.Reading{
 				OutgoingPerIncoming: 0.003, At: time.Now(), Sources: 2,
-				Spread: test.volatility,
+				Spread: 0.01, Volatility: test.volatility,
 			}
 			s.priceErr = nil
 
-			got, err := s.pricer(s.sides[0], inv, s.sides[0].balance)(context.Background())
+			sd := s.sides[test.dir]
+			got, err := s.pricer(sd, inv, bal)(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got.Spread < test.wantAtLeast {
-				t.Errorf("spread %g is below %g, so one of the two reasons "+
-					"to widen was dropped", got.Spread, test.wantAtLeast)
+			if !test.want(got.Spread) {
+				t.Errorf("spread %g", got.Spread)
 			}
 		})
 	}

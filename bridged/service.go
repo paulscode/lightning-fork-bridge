@@ -327,11 +327,16 @@ func (s *Service) priceCheck(sd *side) runner.PriceCheck {
 
 // pricer combines the market price with what the outgoing side is holding.
 //
-// The spread is the larger of the two the bridge computes: the rate oracle
-// widens for volatility, the inventory policy widens for how drained the
-// outgoing side is, and both are reasons to charge more. Taking the larger
-// charges enough for whichever risk is bigger; taking either alone would
-// underprice the other.
+// The spread is the inventory policy's, for the position, with the market's
+// own recent move added on top, as the fork prices it. The inventory policy
+// widens the side running low and discounts the side that refills it; the
+// move is the oracle's volatility times rate.volatilityMultiple, capped at
+// rate.maxSpread, and covers a market that moves while a quote is honoured.
+//
+// The two are added, not the larger taken. The larger of the two never fell
+// below rate.baseSpread, so the replenishing discount, which takes the
+// inventory spread under its base, was never charged. rate.baseSpread itself
+// takes no part: the calm-market spread is the inventory policy's baseSpread.
 func (s *Service) pricer(sd *side, inv inventory.Policy,
 	position func(context.Context) (uint64, error)) quote.Pricer {
 
@@ -363,9 +368,11 @@ func (s *Service) pricer(sd *side, inv inventory.Policy,
 		if err != nil {
 			return rate.Reading{}, err
 		}
-		if pos.Spread > r.Spread {
-			r.Spread = pos.Spread
+		moved := r.Volatility * s.cfg.Rate.VolatilityMultiple
+		if moved > s.cfg.Rate.MaxSpread {
+			moved = s.cfg.Rate.MaxSpread
 		}
+		r.Spread = pos.Spread + moved
 
 		return r, nil
 	}

@@ -134,7 +134,10 @@ type Config struct {
 	// Margin is the HTLC timing policy both directions are sized against.
 	Margin margin.Policy `json:"margin"`
 
-	// Rate is how the price is combined and when to stop trusting it.
+	// Rate is how the price is combined and when to stop trusting it. Its
+	// volatilityMultiple and maxSpread size the spread added for the
+	// market's move; its baseSpread does not price swaps, since the
+	// calm-market spread is each direction's inventory baseSpread.
 	Rate rate.Policy `json:"rate"`
 
 	// RateSources are where the price comes from. There is no fallback: a
