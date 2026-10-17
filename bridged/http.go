@@ -180,6 +180,10 @@ func (s *Service) handleQuote(w http.ResponseWriter, r *http.Request) {
 // caller is who a quote request is from, for its limits: the address it came
 // from, without the port, which changes with every connection. It is what the
 // swap's record carries as its participant.
+//
+// An IPv6 address is taken by its /64: one connection is usually given a
+// whole /64, and an address each from it would be a fresh set of limits per
+// request.
 func caller(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -189,6 +193,11 @@ func caller(r *http.Request) string {
 		// Never the operator's empty participant, which is not
 		// limited.
 		return "unknown"
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		return "addr:" + (&net.IPNet{
+			IP: ip.Mask(net.CIDRMask(64, 128)), Mask: net.CIDRMask(64, 128),
+		}).String()
 	}
 
 	return "addr:" + host

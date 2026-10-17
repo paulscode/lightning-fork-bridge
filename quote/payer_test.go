@@ -574,3 +574,37 @@ func TestLimitsHoldUnderARace(t *testing.T) {
 			len(pending))
 	}
 }
+
+// TestIdleParticipantsAreForgotten: a participant with no quote in hand and
+// none in the last minute is dropped from memory, so callers that come and
+// go, one address each, do not grow it for as long as the process runs. One
+// still inside its minute is kept, and still limited.
+func TestIdleParticipantsAreForgotten(t *testing.T) {
+	ctx := context.Background()
+	q, _, _ := limited(t, Limits{PerMinute: 1})
+	clock := now
+	q.Now = func() time.Time { return clock }
+
+	for i := range 3 {
+		_, _ = q.QuoteFor(ctx, fmt.Sprintf("addr:%d", i),
+			fmt.Sprintf("lnbc1-%d", i))
+	}
+	clock = clock.Add(30 * time.Second)
+	if _, err := q.QuoteFor(ctx, "alice", "lnbc1-alice"); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(45 * time.Second)
+	_, _ = q.QuoteFor(ctx, "bob", "lnbc1-bob")
+
+	q.whoMu.Lock()
+	n := len(q.who)
+	q.whoMu.Unlock()
+	if n != 2 {
+		t.Errorf("%d participants remembered, want alice and bob", n)
+	}
+	if _, err := q.QuoteFor(ctx, "alice", "lnbc1-alice2"); CodeOf(err) !=
+		CodeLimit {
+
+		t.Errorf("alice, inside her minute, was not limited: %v", err)
+	}
+}

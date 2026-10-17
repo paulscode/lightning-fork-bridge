@@ -140,8 +140,17 @@ There is no authentication. A quote commits the bridge's money, so this belongs
 on loopback or behind something that authenticates, and a weak scheme here
 would be worse than saying so plainly. Each address that asks for quotes is
 limited on its own (`limits`: unpaid quotes, unfinished swaps, quotes per
-minute), which bounds what one caller can reserve; behind a proxy every caller
-is the proxy's address, and limiting per user is the proxy's job.
+minute), which bounds what one caller can reserve. An IPv6 caller is its /64,
+since one connection is usually given a whole one.
+
+Behind Tor or a reverse proxy, every request comes from the same address (the
+local Tor daemon's, or the proxy's), so every caller shares one set of limits
+and the limits become global: one caller can use them all up. To limit per
+user there, have each user authenticate to the proxy with their own
+credentials and have the proxy connect to the bridge from a different
+loopback address for each user (nginx's `proxy_bind` with a map from the
+authenticated user to an address in 127.0.0.0/8, for example). Each address
+is then one user, and gets that user's limits.
 
 Which direction a request is depends on the invoice, and the daemon works that
 out by asking each paying node to decode it rather than by parsing it here. The

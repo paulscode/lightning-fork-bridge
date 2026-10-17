@@ -137,13 +137,14 @@ type Config struct {
 	Margin margin.Policy `json:"margin"`
 
 	// Limits bounds each caller of POST /quote on their own, a caller
-	// being the address the request came from: how many unpaid quotes and
-	// unfinished swaps it may hold, and how many quotes it may ask for in
-	// a minute. Absent, quote.DefaultLimits; a zero field means no limit.
+	// being the address the request came from, an IPv6 one by its /64: how
+	// many unpaid quotes and unfinished swaps it may hold, and how many
+	// quotes it may ask for in a minute. Absent, quote.DefaultLimits; a
+	// zero field means no limit.
 	//
-	// Behind a reverse proxy every request comes from the proxy, so every
-	// caller shares one set of limits, and limiting per user is the
-	// proxy's to do.
+	// Behind Tor or a reverse proxy every request comes from one address,
+	// so every caller shares one set of limits and they are global. The
+	// README says how to give each user an address of their own there.
 	Limits quote.Limits `json:"limits"`
 
 	// Rate is how the price is combined and when to stop trusting it. Its

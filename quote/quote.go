@@ -231,17 +231,64 @@ type Quoter struct {
 	mu      sync.Mutex
 	quoting map[node.Hash]struct{}
 
-	// whoMu guards who and recent.
+	// whoMu guards who, swept and each participant's users and recent.
 	whoMu sync.Mutex
-	// who holds one lock per participant, taken for the length of a quote,
-	// so two quotes from one participant cannot both pass a limit that only
-	// one of them fits under.
-	who map[string]*sync.Mutex
-	// recent is when each participant's last quotes were asked for, for the
-	// per-minute limit. In memory only: a restart forgetting it lets a
-	// participant quote again sooner, which the open-quote limit, kept in
-	// the journal, still bounds.
-	recent map[string][]time.Time
+	// who is each participant quoting now or in the last minute. An entry
+	// with neither is dropped (see sweep), so callers that come and go do
+	// not grow it for as long as the process runs.
+	who map[string]*participant
+	// swept is when who was last swept.
+	swept time.Time
+}
+
+// participant is one participant's lock and recent quotes.
+type participant struct {
+	// mu is taken for the length of a quote, so two quotes from one
+	// participant cannot both pass a limit that only one of them fits
+	// under.
+	mu sync.Mutex
+
+	// users is how many quotes hold or wait for mu.
+	users int
+
+	// recent is when their last quotes were asked for, for the per-minute
+	// limit. In memory only: a restart forgetting it lets a participant
+	// quote again sooner, which the open-quote limit, kept in the journal,
+	// still bounds.
+	recent []time.Time
+}
+
+// sweepEvery is how often idle participants are dropped.
+const sweepEvery = time.Minute
+
+// sweep drops every participant with no quote in hand and none in the last
+// minute, at most once every sweepEvery. Called with whoMu held.
+func (q *Quoter) sweep(now time.Time) {
+	if now.Sub(q.swept) < sweepEvery {
+		return
+	}
+	q.swept = now
+	for who, p := range q.who {
+		if p.users > 0 {
+			continue
+		}
+		p.recent = within(p.recent, now)
+		if len(p.recent) == 0 {
+			delete(q.who, who)
+		}
+	}
+}
+
+// within keeps the times less than a minute before now, in place.
+func within(times []time.Time, now time.Time) []time.Time {
+	kept := times[:0]
+	for _, t := range times {
+		if now.Sub(t) < time.Minute {
+			kept = append(kept, t)
+		}
+	}
+
+	return kept
 }
 
 // Limits is what one participant may hold. A zero field means no limit.
@@ -275,31 +322,31 @@ func (q *Quoter) enter(ctx context.Context, who string,
 
 	q.whoMu.Lock()
 	if q.who == nil {
-		q.who = map[string]*sync.Mutex{}
-		q.recent = map[string][]time.Time{}
+		q.who = map[string]*participant{}
 	}
-	mu, ok := q.who[who]
+	q.sweep(now)
+	p, ok := q.who[who]
 	if !ok {
-		mu = &sync.Mutex{}
-		q.who[who] = mu
+		p = &participant{}
+		q.who[who] = p
 	}
+	p.users++
 	q.whoMu.Unlock()
 
-	mu.Lock()
-	release := mu.Unlock
+	p.mu.Lock()
+	release := func() {
+		p.mu.Unlock()
+		q.whoMu.Lock()
+		p.users--
+		q.whoMu.Unlock()
+	}
 
 	if n := q.Limits.PerMinute; n > 0 {
 		q.whoMu.Lock()
-		kept := q.recent[who][:0]
-		for _, t := range q.recent[who] {
-			if now.Sub(t) < time.Minute {
-				kept = append(kept, t)
-			}
-		}
-		q.recent[who] = kept
-		over := len(kept) >= n
+		p.recent = within(p.recent, now)
+		over := len(p.recent) >= n
 		if !over {
-			q.recent[who] = append(q.recent[who], now)
+			p.recent = append(p.recent, now)
 		}
 		q.whoMu.Unlock()
 

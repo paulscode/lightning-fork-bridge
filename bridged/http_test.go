@@ -610,3 +610,24 @@ func TestEachCallerHasItsOwnLimits(t *testing.T) {
 		t.Errorf("another caller: %d %s", w.Code, w.Body.String())
 	}
 }
+
+// TestAnIPv6CallerIsItsSlash64: one connection is usually given a whole /64,
+// and taking each address in it as its own caller would give a fresh set of
+// limits per request. IPv4 callers stay one address each.
+func TestAnIPv6CallerIsItsSlash64(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range []struct{ remote, want string }{
+		{"[2001:db8:1:2:aaaa::1]:4000", "addr:2001:db8:1:2::/64"},
+		{"[2001:db8:1:2:bbbb::9]:4001", "addr:2001:db8:1:2::/64"},
+		{"[2001:db8:1:3::1]:4000", "addr:2001:db8:1:3::/64"},
+		{"192.0.2.7:4000", "addr:192.0.2.7"},
+		{"[::ffff:192.0.2.7]:4000", "addr:::ffff:192.0.2.7"},
+	} {
+		r := httptest.NewRequest(http.MethodPost, "/quote", nil)
+		r.RemoteAddr = c.remote
+		if got := caller(r); got != c.want {
+			t.Errorf("%s is %q, want %q", c.remote, got, c.want)
+		}
+	}
+}
