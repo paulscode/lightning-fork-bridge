@@ -550,3 +550,35 @@ func TestOneVenueIsNotAPrice(t *testing.T) {
 			err)
 	}
 }
+
+// TestAnUnusablePriceIsLeftOutLikeAFailedOne: a source answering zero, a
+// negative price or one that is not a number has failed, and is left out like
+// one that did not answer. Handed to the oracle, it refused every reading.
+func TestAnUnusablePriceIsLeftOutLikeAFailedOne(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{`{"price": 0}`, `{"price": -0.0031}`,
+		`{"price": "NaN"}`, `{"price": "+Inf"}`} {
+
+		s := samplingWith(t, nil,
+			RateSource{Name: "good", URL: serving(t, 200,
+				`{"price": 0.0031}`), Field: "price"},
+			RateSource{Name: "also good", URL: serving(t, 200,
+				`{"price": 0.0031}`), Field: "price"},
+			RateSource{Name: "bad", URL: serving(t, 200, body),
+				Field: "price"},
+		)
+		s.samplePrice(context.Background())
+
+		got, err := sampled(s)
+		if err != nil {
+			t.Errorf("%s: the other two did not price: %v", body, err)
+
+			continue
+		}
+		if got.Sources != 2 {
+			t.Errorf("%s: %d sources, want the two good ones", body,
+				got.Sources)
+		}
+	}
+}

@@ -483,8 +483,17 @@ func fetchPrice(ctx context.Context, src RateSource) (float64, time.Time,
 	}
 
 	price, err := extract(doc, src.Field)
-	if err != nil || src.TimeField == "" {
-		return price, time.Time{}, err
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	// Checked here, so that the source is left out like one that did not
+	// answer: the oracle refuses every reading when any one is unusable.
+	if !(price > 0) || math.IsInf(price, 0) {
+		return 0, time.Time{}, fmt.Errorf("%w: %s answered %g",
+			rate.ErrObservation, src.Name, price)
+	}
+	if src.TimeField == "" {
+		return price, time.Time{}, nil
 	}
 
 	at, err := extractTime(doc, src.TimeField)
