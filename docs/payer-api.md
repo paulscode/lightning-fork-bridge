@@ -119,7 +119,15 @@ Creates the swap and the hold invoice that pays for it.
 ```
 
 - Pay `hold_invoice` before `expires_at` (Unix seconds), or the bridge cancels
-  it.
+  it. `expires_at` is a few minutes away at most, and sooner for an invoice
+  that expires soon: 10 seconds before the invoice being paid expires, so a
+  quote on an invoice with 45 seconds left expires in 35. The bridge quotes an
+  invoice with at least 20 seconds left, so `expires_at` can be as little as
+  10 seconds away. When `expires_at` is cut short this way the hold invoice
+  expires with it.
+- An invoice that expires while the bridge is paying it costs the payer
+  nothing but the wait: a payout that arrives too late fails, and the payer's
+  held payment is cancelled, which refunds it.
 - `cltv_delta` is the hold invoice's final CLTV in BLAKE2b blocks. It is large
   on purpose: the incoming leg must outlive the outgoing one in wall-clock
   time, and the BLAKE2b chain's blocks can come far faster than ten minutes.
@@ -137,7 +145,10 @@ If any check fails, the payer does not pay. A wrong hash or a wrong destination
 means the bridge is not behaving as this document says.
 
 **Quote at the moment of paying, then pay at once.** A quote reserves the
-bridge's liquidity until it expires, and per-participant limits count it.
+bridge's liquidity until it expires, and per-participant limits count it. An
+invoice that lives about a minute, as a point-of-sale one may, is best quoted
+as soon as it is read, since every second spent before the quote comes out of
+the time left to pay it.
 
 ### 2.3 `POST /v2/bridge/swap`
 
@@ -188,7 +199,7 @@ A payer branches on the code and may show the sentence.
 | `no_direction` | 400 | The invoice is for a chain whose direction this bridge does not serve. |
 | `no_amount` | 400 | The invoice names no amount. |
 | `too_small`, `too_large` | 400 | Outside `min_msat`..`max_msat`. |
-| `expires_soon` | 400 | The invoice has too little time left to be paid safely. |
+| `expires_soon` | 400 | The invoice has too little time left to be paid: under 20 seconds by default. Ask the recipient for a new invoice. |
 | `route_budget` | 400 | The destination's final-hop CLTV leaves no room for a route. |
 | `self_payment` | 400 | The invoice is payable to the bridge's own node. |
 | `no_liquidity` | 400 | Not enough left on the paying side right now. |

@@ -84,7 +84,8 @@
       "invoiceExpiry": 600000000000,
       "outgoingCLTVLimit": 80,
       "feeFraction": 0.003,
-      "minRemainingLife": 120000000000
+      "minRemainingLife": 20000000000,
+      "quoteReserve": 10000000000
     },
     "inventory": {
       "TargetOutgoingMsat": 100000000,
@@ -106,7 +107,8 @@
       "invoiceExpiry": 600000000000,
       "outgoingCLTVLimit": 80,
       "feeFraction": 0.003,
-      "minRemainingLife": 120000000000
+      "minRemainingLife": 20000000000,
+      "quoteReserve": 10000000000
     },
     "inventory": {
       "TargetOutgoingMsat": 100000000,

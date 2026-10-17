@@ -53,11 +53,14 @@ type Policy struct {
 	MinSwapMsat uint64
 	MaxSwapMsat uint64
 
-	// Validity is how long a quoted rate is honoured.
+	// Validity is how long a quoted rate is honoured, at most: a quote on
+	// an invoice with little life left is valid for less (see
+	// QuoteReserve).
 	Validity time.Duration
 
-	// InvoiceExpiry is how long the hold invoice lives. It must be at least
-	// Validity, or a quote could outlive the invoice it is for.
+	// InvoiceExpiry is how long the hold invoice lives, at most, like
+	// Validity. It must be at least Validity, or a quote could outlive the
+	// invoice it is for.
 	InvoiceExpiry time.Duration
 
 	// OutgoingCLTVLimit is the CLTV budget imposed on the outgoing route, in
@@ -78,7 +81,22 @@ type Policy struct {
 	// MinRemainingLife is how long the outgoing invoice must still be payable
 	// for. A quote on an invoice about to expire sells something the bridge
 	// may not be able to deliver.
+	//
+	// It can be short. An invoice's expiry decides whether the payout
+	// arrives in time, never who keeps the money: the payer's HTLC is
+	// settled only with the preimage the payout returns, and a payout that
+	// cannot arrive before the invoice expires fails, which gives the
+	// payer's funds back. What it buys is a quote with time left to be
+	// paid: a quote is valid for this less QuoteReserve, at least.
 	MinRemainingLife time.Duration
+
+	// QuoteReserve is how much of the outgoing invoice's life a quote does
+	// not sell: the quote, and the hold invoice that carries it, end this
+	// long before the invoice they pay for, so that a payer who funds at
+	// the last moment leaves the bridge time to pay. It should be at least
+	// the runner's GateReserve, which refuses a payout with less left than
+	// that.
+	QuoteReserve time.Duration
 }
 
 // DefaultPolicy is a starting point sized for the design's Stage 1: a $2-3k
@@ -92,8 +110,15 @@ var DefaultPolicy = Policy{
 	OutgoingCLTVLimit: 80,
 	FeeFraction:       0.003,
 	MinFeeMsat:        10_000, // 10 sats
-	MinRemainingLife:  15 * time.Minute,
+	MinRemainingLife:  20 * time.Second,
+	QuoteReserve:      10 * time.Second,
 }
+
+// MinValidity is the shortest a quote may be valid for. A hold invoice's
+// expiry is counted in whole seconds, and lnd reads none as its default of a
+// day, so a quote valid for less than a second would carry an invoice that
+// outlives it by that much.
+const MinValidity = time.Second
 
 // Valid reports whether the policy can be used.
 func (p Policy) Valid() error {
@@ -110,9 +135,15 @@ func (p Policy) Valid() error {
 		return fmt.Errorf("%w: no outgoing CLTV limit", ErrPolicy)
 	case p.FeeFraction < 0:
 		return fmt.Errorf("%w: negative fee fraction", ErrPolicy)
-	case p.MinRemainingLife < p.Validity:
-		return fmt.Errorf("%w: quoting for %v against invoices with %v left",
-			ErrPolicy, p.Validity, p.MinRemainingLife)
+	case p.QuoteReserve < 0:
+		return fmt.Errorf("%w: a negative quote reserve", ErrPolicy)
+	case p.MinRemainingLife < p.QuoteReserve+MinValidity:
+		// A quote is valid for what is left of the invoice less the
+		// reserve, so an invoice with no more than the reserve left
+		// would be quoted for no time at all.
+		return fmt.Errorf("%w: invoices with %v left, less a %v reserve, "+
+			"leave a quote less than %v", ErrPolicy, p.MinRemainingLife,
+			p.QuoteReserve, MinValidity)
 	}
 
 	return nil
@@ -153,7 +184,9 @@ type Quote struct {
 	// the incoming chain.
 	CLTVDelta uint32
 
-	// Expires is when the rate stops being honoured.
+	// Expires is when the rate stops being honoured: Policy.Validity from
+	// the quote, or sooner, QuoteReserve before the outgoing invoice
+	// expires.
 	Expires time.Time
 
 	// Description is the outgoing invoice's own, shown back to the payer.
@@ -594,17 +627,41 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 			ErrRefused, err)
 	}
 	terms.CLTVDelta = blocks
-	terms.Expires = now.Add(q.Policy.Validity)
+	validity, holdExpiry := q.lives(dec, now)
+	terms.Expires = now.Add(validity)
 
 	rec, err := q.reserve(ctx, terms, who, now, forget)
 	if err != nil {
 		return Quote{}, err
 	}
-	if err := q.offer(ctx, rec, &terms); err != nil {
+	if err := q.offer(ctx, rec, &terms, holdExpiry); err != nil {
 		return Quote{}, err
 	}
 
 	return terms, nil
+}
+
+// lives is how long a quote on an invoice is valid for, and how long its hold
+// invoice lives: the policy's, or what is left of the invoice less
+// QuoteReserve when that is shorter, so that neither outlasts what the bridge
+// can still deliver. In whole seconds, as a hold invoice's expiry is, so the
+// quote and the invoice carrying it end together. checkInvoice has refused an
+// invoice with less than MinRemainingLife left, so both are at least
+// MinValidity.
+func (q *Quoter) lives(dec node.Decoded, now time.Time) (time.Duration,
+	time.Duration) {
+
+	left := (dec.Expiry.Sub(now) - q.Policy.QuoteReserve).Truncate(
+		time.Second)
+	validity, hold := q.Policy.Validity, q.Policy.InvoiceExpiry
+	if left < validity {
+		validity = left
+	}
+	if left < hold {
+		hold = left
+	}
+
+	return validity, hold
 }
 
 // fits refuses a payout the bridge has no room for. What the bridge can
@@ -817,7 +874,9 @@ func (q *Quoter) checkInvoice(dec node.Decoded, now time.Time) error {
 	if dec.Expiry.Sub(now) < q.Policy.MinRemainingLife {
 		// Quoting against an invoice about to expire sells something the
 		// bridge may not be able to deliver: the payer funds the incoming
-		// leg and the outgoing one can no longer be paid.
+		// leg and the outgoing one can no longer be paid. The payout then
+		// fails and the payer is refunded, so this is about the payer's
+		// time, not their money.
 		return fmt.Errorf("%w: %w: the invoice has %v left, less than the "+
 			"%v a quote needs", ErrRefused, ErrExpiresSoon,
 			dec.Expiry.Sub(now).Round(time.Second), q.Policy.MinRemainingLife)
@@ -919,13 +978,13 @@ func (q *Quoter) feeBudget(amountMsat uint64) uint64 {
 // recoverable — the driver finds a swap recorded as quoted whose invoice
 // exists, and catches the record up.
 func (q *Quoter) offer(ctx context.Context, rec store.Record,
-	terms *Quote) error {
+	terms *Quote, expiry time.Duration) error {
 
 	hold, err := q.In.AddHoldInvoice(ctx, node.HoldInvoice{
 		Hash:       terms.Hash,
 		AmountMsat: terms.IncomingMsat,
 		CLTVDelta:  terms.CLTVDelta,
-		Expiry:     q.Policy.InvoiceExpiry,
+		Expiry:     expiry,
 		Memo:       terms.Description,
 		Metadata:   node.InvoiceMetadata(terms.Outgoing),
 	})

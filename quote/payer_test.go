@@ -80,7 +80,7 @@ func TestEveryRefusalHasItsCode(t *testing.T) {
 			d.AmountMsat = q.Policy.MaxSwapMsat + 1
 		}, CodeTooLarge},
 		{"expires soon", func(q *Quoter, d *node.Decoded, in *fakeIn) {
-			d.Expiry = now.Add(time.Minute)
+			d.Expiry = now.Add(15 * time.Second)
 		}, CodeExpiresSoon},
 		{"route budget", func(q *Quoter, d *node.Decoded, in *fakeIn) {
 			d.CLTVDelta = q.Policy.OutgoingCLTVLimit

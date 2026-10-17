@@ -337,6 +337,78 @@ func TestARoutingBudgetWiderThanTheSpreadIsRefused(t *testing.T) {
 	}
 }
 
+// TestAShortLivedInvoiceGetsAShortQuote: an invoice with less life left than
+// the policy's validity is quoted for what is left of it less QuoteReserve,
+// and its hold invoice lives no longer, so a payer cannot fund a swap the
+// bridge has no time left to pay. One with less than MinRemainingLife left is
+// refused as expires_soon. Times are cut to whole seconds, as a hold
+// invoice's expiry is.
+func TestAShortLivedInvoiceGetsAShortQuote(t *testing.T) {
+	ctx := context.Background()
+
+	for _, c := range []struct {
+		name           string
+		left           time.Duration
+		validity, hold time.Duration
+	}{
+		{"45 s", 45 * time.Second, 35 * time.Second, 35 * time.Second},
+		{"25 s", 25 * time.Second, 15 * time.Second, 15 * time.Second},
+		{"the floor", 20 * time.Second, 10 * time.Second, 10 * time.Second},
+		{"a part second", 45*time.Second + 700*time.Millisecond,
+			35 * time.Second, 35 * time.Second},
+		{"longer than the validity", 5 * time.Minute,
+			DefaultPolicy.Validity, 4*time.Minute + 50*time.Second},
+		{"longer than the hold invoice", time.Hour,
+			DefaultPolicy.Validity, DefaultPolicy.InvoiceExpiry},
+		{"15 s", 15 * time.Second, 0, 0},
+		{"just under the floor", 20*time.Second - time.Millisecond, 0, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dec := decoded()
+			dec.Expiry = now.Add(c.left)
+			in := &fakeIn{}
+			q, st := build(t, in, &fakeOut{decoded: dec}, 0.01)
+
+			got, err := q.Quote(ctx, "lnbc1x")
+			if c.validity == 0 {
+				if CodeOf(err) != CodeExpiresSoon {
+					t.Fatalf("want expires_soon, got %v", err)
+				}
+				if in.asked != nil {
+					t.Error("it created an invoice anyway")
+				}
+
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if want := now.Add(c.validity); !got.Expires.Equal(want) {
+				t.Errorf("the quote expires in %v, want %v",
+					got.Expires.Sub(now), c.validity)
+			}
+			if in.asked == nil {
+				t.Fatal("no hold invoice was created")
+			}
+			if in.asked.Expiry != c.hold {
+				t.Errorf("the hold invoice lives %v, want %v",
+					in.asked.Expiry, c.hold)
+			}
+			// The runner lapses the quote, and gives back a swap
+			// funded too late, from the record.
+			rec, err := st.Get(ctx, hash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !rec.QuoteExpiry.Equal(got.Expires) {
+				t.Errorf("recorded expiry %v, quoted %v",
+					rec.QuoteExpiry, got.Expires)
+			}
+		})
+	}
+}
+
 // TestInvoicesTheBridgeWillNotTouch.
 func TestInvoicesTheBridgeWillNotTouch(t *testing.T) {
 	ctx := context.Background()
@@ -355,7 +427,7 @@ func TestInvoicesTheBridgeWillNotTouch(t *testing.T) {
 			// The payer funds the incoming leg and the outgoing one can no
 			// longer be paid.
 			"one about to expire",
-			func(d *node.Decoded) { d.Expiry = now.Add(time.Minute) },
+			func(d *node.Decoded) { d.Expiry = now.Add(15 * time.Second) },
 		},
 		{"one already expired",
 			func(d *node.Decoded) { d.Expiry = now.Add(-time.Minute) }},
@@ -526,11 +598,22 @@ func TestPolicyRefusesWhatCannotWork(t *testing.T) {
 		{"no outgoing CLTV limit",
 			func(p *Policy) { p.OutgoingCLTVLimit = 0 }},
 		{"a negative fee fraction", func(p *Policy) { p.FeeFraction = -1 }},
+		{"a negative quote reserve",
+			func(p *Policy) { p.QuoteReserve = -time.Second }},
 		{
-			// Quoting for longer than an invoice is required to have left
-			// means accepting money for something that may already be gone.
-			"quoting for longer than the invoices need to live",
-			func(p *Policy) { p.MinRemainingLife = p.Validity - time.Second },
+			// A quote is valid for what is left of the invoice less the
+			// reserve, so this would quote an invoice for no time at all.
+			"invoices quoted with no more than the reserve left",
+			func(p *Policy) { p.MinRemainingLife = p.QuoteReserve },
+		},
+		{
+			// Less than a second, which a hold invoice's whole-second
+			// expiry cannot carry.
+			"invoices quoted with under a second past the reserve",
+			func(p *Policy) {
+				p.MinRemainingLife = p.QuoteReserve + MinValidity -
+					time.Millisecond
+			},
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
