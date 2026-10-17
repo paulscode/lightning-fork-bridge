@@ -17,7 +17,7 @@ chain and a stock LND for Bitcoin. Nothing here runs on both chains.
 | --- | --- |
 | `chainrate` | How fast a chain is producing blocks, and the bounds a swap may rely on |
 | `margin` | Whether an outgoing payment is safe to commit, and how much incoming CLTV a swap needs |
-| `confirm` | How many confirmations a value at risk needs, priced in forgone block subsidy |
+| `confirm` | How many confirmations a value at risk needs, priced in forgone block subsidy. Not wired: nothing in the bridge calls it yet |
 | `swap` | The state machine for one swap, and the rule that keeps a bridge solvent |
 | `node` | What the bridge needs from the two Lightning nodes, as interfaces |
 | `driver` | When to pay, and what a swap interrupted mid-flight should do |
@@ -32,7 +32,18 @@ chain and a stock LND for Bitcoin. Nothing here runs on both chains.
 `margin` and `confirm` exist because block counts mean different things on the
 two chains. The BLAKE2b chain has run between 1.3x and 19x faster than its ten
 minute target, and a block on it costs about 1/325th as much to produce, so
-neither HTLC timing nor reorg depth can be reasoned about in blocks.
+neither HTLC timing nor reorg depth can be reasoned about in blocks. `confirm`
+is the model for the second and is not yet used by anything here.
+
+`margin.Settlement` is the time allowed between the outgoing HTLC's expiry and
+the incoming one being claimed, and it has to cover the slowest way the bridge
+learns the preimage: the outgoing peer claiming on chain. The bridge's node
+goes to chain the outgoing broadcast delta before the HTLC expires (zero
+blocks in lnd), the peer's claim can still confirm after that, and the bridge
+sees the preimage when it does. So Settlement should be at least the outgoing
+broadcast delta plus the confirmations that claim takes, in blocks of the
+outgoing chain at its slow bound. At chainrate's SHA256 stall factor of 1.5 a
+block is planned at fifteen minutes, so an hour covers four.
 
 `store` is about ordering more than storage. A swap's state has to be durable
 *before* the action it authorises is taken, because after a crash the record is

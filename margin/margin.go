@@ -81,6 +81,14 @@ type Policy struct {
 	// Settlement is the time the bridge allows itself to claim the incoming
 	// HTLC after learning the preimage: seeing the outgoing preimage,
 	// building and broadcasting a claim, and having it confirm.
+	//
+	// It has to cover the slowest way the preimage arrives, which is the
+	// outgoing peer claiming its HTLC on chain: the bridge's node goes to
+	// chain the outgoing broadcast delta before the HTLC expires (zero
+	// blocks in lnd), the peer's claim may still confirm after that, and
+	// the preimage is seen when it does. So it should be at least the
+	// outgoing broadcast delta plus the confirmations that claim takes, in
+	// blocks of the outgoing chain at its slow bound.
 	Settlement time.Duration
 
 	// MaxIncomingBlocks caps what a swap may demand of the incoming leg. A
