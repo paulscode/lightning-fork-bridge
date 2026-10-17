@@ -171,8 +171,10 @@ type Journal struct {
 	size int64
 
 	// Repaired records that a torn record was dropped from the tail at open,
-	// which means the process died mid-write. Nothing was lost that had been
-	// reported durable, but it is worth an operator knowing it happened.
+	// which means the process died mid-write, and RepairedBytes how much was
+	// dropped. Nothing was lost that had been reported durable, but it is
+	// worth an operator knowing it happened: a caller that opens a journal
+	// should log a warning when it is set, since this package does not log.
 	Repaired      bool
 	RepairedBytes int64
 }

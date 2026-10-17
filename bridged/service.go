@@ -137,8 +137,8 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 	}
 	s.closers = append(s.closers, s.btcConn.Close)
 
-	if s.journal, err = store.Open(cfg.Journal); err != nil {
-		return fail(fmt.Errorf("opening the journal %s: %w", cfg.Journal, err))
+	if s.journal, err = loadJournal(cfg.Journal, log); err != nil {
+		return fail(err)
 	}
 	s.closers = append(s.closers, s.journal.Close)
 
@@ -192,6 +192,25 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 	}
 
 	return s, nil
+}
+
+// loadJournal opens the journal and says so if opening it had to repair it.
+//
+// A repair drops a record torn by a crash mid-write. Nothing reported durable
+// is lost, so it does not stop the daemon, but it means the last process died
+// writing, and an operator looking at what happened then needs to know.
+func loadJournal(path string, log *slog.Logger) (*store.Journal, error) {
+	j, err := store.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("opening the journal %s: %w", path, err)
+	}
+	if j.Repaired {
+		log.Warn("the journal ended in a torn record, from a process "+
+			"that died writing it; the record was never reported durable "+
+			"and was dropped", "journal", path, "bytes", j.RepairedBytes)
+	}
+
+	return j, nil
 }
 
 // build wires one direction. inConn receives and outConn pays.
