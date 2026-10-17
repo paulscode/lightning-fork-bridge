@@ -251,10 +251,78 @@ func (s *Service) build(name string, d Direction, inConn, outConn *grpc.ClientCo
 			In: sd.in, Out: sd.out, Store: s.journal, Policy: s.cfg.Margin,
 		},
 		Store: s.journal, Rates: runner.Rates(s.spacing(invert)),
-		Log: s.log.With("direction", name),
+		PriceCheck: s.priceCheck(sd),
+		Log:        s.log.With("direction", name),
 	}
 
 	return sd
+}
+
+// currentPrice is the latest combined reading, refused when there is none or
+// when it is older than the rate policy allows.
+//
+// The oracle bounds how old an observation may be when it combines them.
+// Nothing bounds how old the combined reading is by the time it is used, and a
+// poller that has stopped producing leaves the last one in place indefinitely.
+func (s *Service) currentPrice() (rate.Reading, error) {
+	s.priceMu.RLock()
+	r, err := s.price, s.priceErr
+	s.priceMu.RUnlock()
+	if err != nil {
+		return rate.Reading{}, err
+	}
+
+	if max := s.cfg.Rate.MaxAge; max > 0 {
+		if age := time.Since(r.At); age > max {
+			return rate.Reading{}, fmt.Errorf("%w: the last usable "+
+				"price is %v old and the policy allows %v, so the "+
+				"price feed has stopped", rate.ErrStale,
+				age.Round(time.Second), max)
+		}
+	}
+
+	return r, nil
+}
+
+// priceCheck is asked just before a funded swap is paid: is what the payer
+// sent still worth the payout and its routing budget at the price now?
+//
+// The quote fixed what the payer owes, and they may fund it minutes later, or
+// a stalled gate may hold it for most of the funded grace. If the market
+// moved against the bridge by more than the spread in between, paying would be
+// a loss taken knowingly; giving the payer's funds back costs nobody anything.
+// A price that cannot be read, or is stale, is an error, which waits, and past
+// the funded grace the swap is given back: nothing is paid on a price the
+// bridge cannot see.
+func (s *Service) priceCheck(sd *side) runner.PriceCheck {
+	return func(_ context.Context, sw *driver.Swap) (bool, error) {
+		r, err := s.currentPrice()
+		if err != nil {
+			return false, err
+		}
+
+		price := r.OutgoingPerIncoming
+		if sd.invert {
+			if price <= 0 {
+				return false, fmt.Errorf("%w: cannot invert a rate of %g",
+					rate.ErrObservation, price)
+			}
+			price = 1 / price
+		}
+		worth := float64(sw.IncomingMsat) * price
+		owed := float64(sw.OutgoingMsat) + float64(sw.MaxFeeMsat)
+		if worth >= owed {
+			return true, nil
+		}
+
+		s.log.Warn("giving a swap back: the market moved since it was "+
+			"quoted", "direction", sd.name,
+			"hash", fmt.Sprintf("%x", sw.Hash[:8]), "price", price,
+			"incomingMsat", sw.IncomingMsat, "worthMsat", worth,
+			"outgoingMsat", sw.OutgoingMsat, "maxFeeMsat", sw.MaxFeeMsat)
+
+		return false, nil
+	}
 }
 
 // pricer combines the market price with what the outgoing side is holding.
@@ -268,25 +336,12 @@ func (s *Service) pricer(sd *side, inv inventory.Policy,
 	position func(context.Context) (uint64, error)) quote.Pricer {
 
 	return func(ctx context.Context) (rate.Reading, error) {
-		s.priceMu.RLock()
-		r, err := s.price, s.priceErr
-		s.priceMu.RUnlock()
+		// Refuse rather than quote on a price the policy itself would
+		// not have accepted.
+		r, err := s.currentPrice()
 		if err != nil {
-			return rate.Reading{}, err
-		}
-
-		// The oracle bounds how old an observation may be when it combines
-		// them. Nothing bounds how old the combined reading is by the time
-		// a quote uses it, and a poller that has stopped producing leaves
-		// the last one in place indefinitely. Refuse rather than quote on
-		// a price the policy itself would not have accepted.
-		if max := s.cfg.Rate.MaxAge; max > 0 {
-			if age := time.Since(r.At); age > max {
-				return rate.Reading{}, fmt.Errorf("%w: the last usable "+
-					"price is %v old and the policy allows %v, so the "+
-					"price feed has stopped", quote.ErrRefused,
-					age.Round(time.Second), max)
-			}
+			return rate.Reading{}, fmt.Errorf("%w: %w", quote.ErrRefused,
+				err)
 		}
 
 		if sd.invert {

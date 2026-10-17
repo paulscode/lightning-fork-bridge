@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/paulscode/lightning-fork-bridge/chainrate"
+	"github.com/paulscode/lightning-fork-bridge/driver"
 	"github.com/paulscode/lightning-fork-bridge/inventory"
 	"github.com/paulscode/lightning-fork-bridge/margin"
 	"github.com/paulscode/lightning-fork-bridge/node"
@@ -577,5 +578,62 @@ func TestHeadroomIsCountedPerDirection(t *testing.T) {
 			t.Errorf("%s: headroom %d, want %d", s.sides[i].name, room,
 				want)
 		}
+	}
+}
+
+// TestAFundedSwapIsPaidOnlyAtAPriceThatCoversIt: the runner asks just before
+// paying whether what the payer sent still covers the payout and its routing
+// budget at the price now. A move against the bridge gives the funds back; a
+// stale price waits, and past the funded grace the swap is given back, so the
+// grace path never pays on a price nobody can see. Both directions are wired
+// with it.
+func TestAFundedSwapIsPaidOnlyAtAPriceThatCoversIt(t *testing.T) {
+	t.Parallel()
+
+	s := testService(t, &fakeOut{accepts: "lnbc"}, nil, nil)
+	s.cfg.Rate.MaxAge = 90 * time.Second
+	s.priceErr = nil
+	sd := s.sides[0]
+
+	// 1,000,000 msat in at 0.0031 is worth 3,100 msat out.
+	sw := &driver.Swap{IncomingMsat: 1_000_000, OutgoingMsat: 3_000,
+		MaxFeeMsat: 100}
+	for _, c := range []struct {
+		price float64
+		ok    bool
+	}{
+		{0.0031, true},
+		{0.00309, false},
+	} {
+		s.price = rate.Reading{OutgoingPerIncoming: c.price,
+			At: time.Now(), Sources: 2}
+		ok, err := s.priceCheck(sd)(context.Background(), sw)
+		if err != nil || ok != c.ok {
+			t.Errorf("at %g: %v (%v), want %v", c.price, ok, err, c.ok)
+		}
+	}
+
+	// The reverse direction inverts the price.
+	rev := &side{name: "toBlake2b", invert: true}
+	s.price = rate.Reading{OutgoingPerIncoming: 1 / 0.0031, At: time.Now(),
+		Sources: 2}
+	if ok, err := s.priceCheck(rev)(context.Background(), sw); err != nil ||
+		!ok {
+
+		t.Errorf("the inverted price refused: %v (%v)", ok, err)
+	}
+
+	// A stale price is not an answer.
+	s.price = rate.Reading{OutgoingPerIncoming: 0.0031,
+		At: time.Now().Add(-time.Hour), Sources: 2}
+	if _, err := s.priceCheck(sd)(context.Background(), sw); err == nil {
+		t.Error("a stale price was checked against")
+	}
+
+	// And it is wired into the runner build makes.
+	built := s.build("toBitcoin", Direction{Inventory: inventoryForTest()},
+		nil, nil, sd.balance, inventory.Draining, false, nil)
+	if built.runner.PriceCheck == nil {
+		t.Error("the runner has no price check")
 	}
 }
