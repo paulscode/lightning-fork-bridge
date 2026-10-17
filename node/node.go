@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -240,6 +241,22 @@ type PayRequest struct {
 	// in flight, but not how long an HTLC that has already left can take to
 	// resolve on chain, which is what CLTVLimit bounds.
 	Timeout time.Duration
+}
+
+// TimeoutSeconds is a PayRequest's Timeout in the whole seconds lnd's
+// SendPaymentV2 counts it in. Rounded up, so an attempt is never cut shorter
+// than asked, and never under one: lnd reads zero as its own default, a
+// minute, which would undo a timeout cut to an invoice's last seconds.
+func TimeoutSeconds(d time.Duration) int32 {
+	if d >= math.MaxInt32*time.Second {
+		return math.MaxInt32
+	}
+	secs := (d + time.Second - 1) / time.Second
+	if secs < 1 {
+		return 1
+	}
+
+	return int32(secs)
 }
 
 // Incoming is the node the bridge receives on.

@@ -2,7 +2,9 @@ package node
 
 import (
 	"encoding/hex"
+	"math"
 	"testing"
+	"time"
 )
 
 func TestStateNames(t *testing.T) {
@@ -88,4 +90,29 @@ func FuzzPreimageHash(f *testing.F) {
 				pa, pb, pa == pb, pa.Hash() == pb.Hash())
 		}
 	})
+}
+
+// TestTimeoutSecondsRoundsUpAndNeverToNone: a timeout cut to an invoice's last
+// seconds reaches lnd as whole seconds, rounded up so the attempt is not cut
+// shorter than asked, and never as zero, which lnd reads as its own default of
+// a minute.
+func TestTimeoutSecondsRoundsUpAndNeverToNone(t *testing.T) {
+	for _, c := range []struct {
+		in   time.Duration
+		want int32
+	}{
+		{-time.Second, 1},
+		{0, 1},
+		{time.Millisecond, 1},
+		{time.Second, 1},
+		{time.Second + time.Millisecond, 2},
+		{11 * time.Second, 11},
+		{2 * time.Minute, 120},
+		{math.MaxInt32 * time.Second, math.MaxInt32},
+		{math.MaxInt64, math.MaxInt32},
+	} {
+		if got := TimeoutSeconds(c.in); got != c.want {
+			t.Errorf("%v: %d, want %d", c.in, got, c.want)
+		}
+	}
 }

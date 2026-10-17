@@ -83,7 +83,7 @@ func (o *Outgoing) Pay(ctx context.Context, req node.PayRequest) (node.Payment,
 
 	stream, err := o.router.SendPaymentV2(ctx, &routerrpc.SendPaymentRequest{
 		PaymentRequest: req.Invoice,
-		TimeoutSeconds: int32(req.Timeout.Seconds()),
+		TimeoutSeconds: node.TimeoutSeconds(req.Timeout),
 		FeeLimitMsat:   int64(req.MaxFeeMsat),
 		CltvLimit:      int32(req.CLTVLimit),
 	})

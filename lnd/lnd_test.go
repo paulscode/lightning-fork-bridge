@@ -732,6 +732,41 @@ func TestPayReturnsTheTerminalUpdate(t *testing.T) {
 	}
 }
 
+// TestPaySendsAShortTimeoutInWholeSeconds: a timeout the runner cut to an
+// invoice's last seconds reaches the node rounded up, not truncated, and a
+// part of a second as one, never as the zero lnd reads as a minute.
+func TestPaySendsAShortTimeoutInWholeSeconds(t *testing.T) {
+	for _, c := range []struct {
+		timeout time.Duration
+		want    int32
+	}{
+		{11 * time.Second, 11},
+		{10*time.Second + 300*time.Millisecond, 11},
+		{300 * time.Millisecond, 1},
+	} {
+		t.Run(c.timeout.String(), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(),
+				5*time.Second)
+			defer cancel()
+
+			f := &fakeNode{info: synced, payments: []*lnrpc.Payment{
+				pmt(lnrpc.Payment_FAILED, node.Preimage{}),
+			}}
+			out := NewOutgoing(serve(t, f))
+
+			if _, err := out.Pay(ctx, node.PayRequest{
+				Invoice: "lnbc1fake", CLTVLimit: 40, MaxFeeMsat: 5000,
+				Timeout: c.timeout,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.sendReq.GetTimeoutSeconds(); got != c.want {
+				t.Errorf("timeout_seconds %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
 // TestPayRefusesAnUnboundedRoute. Without a CLTV limit the route can be as
 // long as the network allows, and the incoming leg was sized against a
 // specific number.
