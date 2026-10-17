@@ -51,30 +51,28 @@
   },
   "rateSources": [
     {
-      "name": "venue-a",
-      "url": "https://example.invalid/api/ticker/BTCB2_BTC",
-      "field": "last",
-      "timeField": "computedAt"
-    },
-    {
-      "name": "venue-b",
-      "url": "https://example2.invalid/v1/price",
-      "field": "data.price",
-      "maxUnchanged": 3600000000000
+      "name": "neoxa-btcb2-btc",
+      "venue": "neoxa.exchange",
+      "url": "https://neoxa.exchange/api/exchange/ticker/BTCB2_BTC",
+      "field": "ticker.lastPrice",
+      "timeField": "ticker.computedAt"
     }
   ],
   "crossCheck": {
-    "name": "venue-a-usd",
+    "name": "nonkyc-btcb2-usdt",
     "incomingUSD": {
-      "name": "venue-a-btcb2-usd",
-      "url": "https://example.invalid/api/ticker/BTCB2_USDC",
-      "field": "last",
-      "timeField": "computedAt"
+      "name": "nonkyc-btcb2-usdt-last",
+      "venue": "nonkyc.io",
+      "url": "https://api.nonkyc.io/api/v2/market/getbysymbol/BTCB2_USDT",
+      "field": "lastPrice",
+      "maxUnchanged": 3600000000000
     },
     "outgoingUSD": {
-      "name": "btc-usd",
-      "url": "https://example3.invalid/v1/btc-usd",
-      "field": "usd"
+      "name": "mempool-btc-usd",
+      "venue": "mempool.space",
+      "url": "https://mempool.space/api/v1/prices",
+      "field": "USD",
+      "maxUnchanged": 3600000000000
     }
   },
   "toBitcoin": {

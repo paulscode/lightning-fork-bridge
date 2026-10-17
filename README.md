@@ -116,6 +116,15 @@ that decides what a swap costs or how long it may take, and unknown keys are an
 error rather than ignored: a misspelled policy key that is quietly dropped
 leaves the daemon running on a number the operator believes they overrode.
 
+A price is quoted only when readings from two venues answer, fresh, and
+agree. Readings from one venue count once however many there are, since a
+venue's books agreeing with each other say nothing about that venue being
+moved: each rate source's `venue` defaults to its URL's host, and the
+cross-check counts as the venue of the BTCB2 price it reads. Name the venue
+where one venue serves from two hosts. The example reads Neoxa's BTCB2_BTC
+ticker and, as the cross-check, NonKYC's BTCB2_USDT over mempool.space's
+BTC/USD, as the fork does.
+
 `-check` loads the configuration, dials both nodes and opens the journal, then
 exits. A configuration error found at deploy time costs a restart; the same
 error found later costs whatever was in flight.

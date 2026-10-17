@@ -134,6 +134,24 @@ func TestRefusals(t *testing.T) {
 			want: "two price sources are called",
 		},
 		{
+			// Two of one venue's markets are one venue's say.
+			name: "one venue twice",
+			edit: func(s string) string {
+				return strings.Replace(s, `"https://y/p"`,
+					`"https://X/q"`, 1)
+			},
+			want: "venues are needed",
+		},
+		{
+			// Two hosts named as one venue are one venue.
+			name: "one venue named twice",
+			edit: func(s string) string {
+				return strings.Replace(s, `"https://y/p",`,
+					`"https://y/p", "venue": "X",`, 1)
+			},
+			want: "venues are needed",
+		},
+		{
 			name: "no direction enabled",
 			edit: func(s string) string {
 				return strings.Replace(s, `"enabled": true`,

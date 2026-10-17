@@ -141,9 +141,9 @@ func TestSamplePriceDropsAFailedSourceRatherThanInventingOne(t *testing.T) {
 	}
 
 	s := &Service{log: quiet(), oracle: oracle, cfg: Config{RateSources: []RateSource{
-		{Name: "good", URL: good, Field: "price"},
-		{Name: "also good", URL: alsoGood, Field: "price"},
-		{Name: "bad", URL: bad, Field: "price"},
+		{Name: "good", URL: good, Field: "price", Venue: "a"},
+		{Name: "also good", URL: alsoGood, Field: "price", Venue: "b"},
+		{Name: "bad", URL: bad, Field: "price", Venue: "c"},
 	}}}
 	s.priceErr = fmt.Errorf("none yet")
 
@@ -317,6 +317,16 @@ func samplingWith(t *testing.T, cc *CrossCheck, srcs ...RateSource) *Service {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Every test server is on one host, which would make every source one
+	// venue; each is its own here unless a test says otherwise.
+	for i := range srcs {
+		if srcs[i].Venue == "" {
+			srcs[i].Venue = srcs[i].Name
+		}
+	}
+	if cc != nil && cc.IncomingUSD.Venue == "" {
+		cc.IncomingUSD.Venue = cc.Name
+	}
 	s := &Service{log: quiet(), oracle: oracle, cfg: Config{
 		RateSources: srcs, CrossCheck: cc,
 	}}
@@ -478,5 +488,65 @@ func TestTheCrossCheckIsDerivedFromDollars(t *testing.T) {
 				t.Errorf("want a disagreement, got %v", err)
 			}
 		})
+	}
+}
+
+// TestOneVenueIsNotAPrice: two readings from one venue agreeing with each
+// other say nothing about that venue being moved, so they are one venue's
+// say, and the price is refused until a second venue answers.
+func TestOneVenueIsNotAPrice(t *testing.T) {
+	t.Parallel()
+
+	ticker := RateSource{Name: "ticker", Venue: "neoxa.exchange",
+		URL: serving(t, 200, `{"price": 0.0031}`), Field: "price"}
+	book := RateSource{Name: "book", Venue: "neoxa.exchange",
+		URL: serving(t, 200, `{"price": 0.0031}`), Field: "price"}
+	other := RateSource{Name: "other", Venue: "api.nonkyc.io",
+		URL: serving(t, 500, `down`), Field: "price"}
+
+	s := samplingWith(t, nil, ticker, book, other)
+	s.samplePrice(context.Background())
+	if _, err := sampled(s); !errors.Is(err, rate.ErrStale) {
+		t.Fatalf("one venue's two readings priced: %v", err)
+	}
+
+	// The same with the second venue answering.
+	other.URL = serving(t, 200, `{"price": 0.0031}`)
+	s = samplingWith(t, nil, ticker, book, other)
+	s.samplePrice(context.Background())
+	got, err := sampled(s)
+	if err != nil {
+		t.Fatalf("two venues refused: %v", err)
+	}
+	if got.Sources != 3 || got.Venues != 2 {
+		t.Errorf("%d sources from %d venues, want 3 from 2", got.Sources,
+			got.Venues)
+	}
+
+	// Nor when the second venue answers with a price too old to use,
+	// which the oracle leaves out.
+	other.URL = serving(t, 200, fmt.Sprintf(`{"price": 0.0031, "at": %d}`,
+		time.Now().Add(-time.Hour).Unix()))
+	other.TimeField = "at"
+	s = samplingWith(t, nil, ticker, book, other)
+	s.samplePrice(context.Background())
+	if _, err := sampled(s); !errors.Is(err, rate.ErrStale) {
+		t.Fatalf("one venue's two readings priced beside a stale one: %v",
+			err)
+	}
+
+	// A cross-check counts as the venue of the BTCB2 price it reads.
+	cc := &CrossCheck{
+		Name: "usd",
+		IncomingUSD: RateSource{Name: "btcb2-usd", Venue: "neoxa.exchange",
+			URL: serving(t, 200, `{"p": 310}`), Field: "p"},
+		OutgoingUSD: RateSource{Name: "btc-usd", Venue: "mempool.space",
+			URL: serving(t, 200, `{"p": 100000}`), Field: "p"},
+	}
+	s = samplingWith(t, cc, ticker)
+	s.samplePrice(context.Background())
+	if _, err := sampled(s); !errors.Is(err, rate.ErrStale) {
+		t.Fatalf("a cross-check on the direct source's venue priced: %v",
+			err)
 	}
 }

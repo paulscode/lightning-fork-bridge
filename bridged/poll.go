@@ -282,16 +282,18 @@ func (s *Service) pollPrice(ctx context.Context) {
 	}
 }
 
-// MinPriceSources is how many readings must answer, fresh, for a price to be
-// quoted: one to be checked against the other.
-const MinPriceSources = 2
+// MinPriceVenues is how many venues' readings must answer, fresh, for a
+// price to be quoted: one to be checked against the other. Readings from one
+// venue count once (see RateSource.Venue).
+const MinPriceVenues = 2
 
 // samplePrice reads every source and combines them.
 //
 // A source that fails is left out rather than defaulted: the oracle's whole
 // job is to notice when sources disagree, and a made-up number that agrees
-// with everything defeats it. If that leaves fewer than MinPriceSources, the
-// price is refused, and the refusal is what quotes see.
+// with everything defeats it. If that leaves readings from fewer than
+// MinPriceVenues venues, the price is refused, and the refusal is what quotes
+// see.
 func (s *Service) samplePrice(ctx context.Context) {
 	// Same reasoning as sampleChain: New always builds the oracle, so a
 	// missing one is a programming error, and a background goroutine is
@@ -313,6 +315,7 @@ func (s *Service) samplePrice(ctx context.Context) {
 		}
 		obs = append(obs, rate.Observation{
 			Source: src.Name, OutgoingPerIncoming: price, At: at,
+			Venue: src.venue(),
 		})
 	}
 	if cc := s.cfg.CrossCheck; cc != nil {
@@ -321,25 +324,32 @@ func (s *Service) samplePrice(ctx context.Context) {
 			s.log.Warn("the cross-check failed", "source", cc.Name,
 				"err", err)
 		} else {
+			o.Venue = cc.venue()
 			obs = append(obs, o)
 		}
 	}
 
+	venues := map[string]bool{}
+	for _, o := range obs {
+		venues[o.Venue] = true
+	}
+
 	var reading rate.Reading
 	var err error
-	if len(obs) < MinPriceSources {
-		err = fmt.Errorf("%w: %d of the price sources answered, and %d "+
-			"are needed to check one against another", rate.ErrStale,
-			len(obs), MinPriceSources)
+	if len(venues) < MinPriceVenues {
+		err = fmt.Errorf("%w: %d of the price sources answered, from %d "+
+			"venues, and %d venues are needed to check one against "+
+			"another", rate.ErrStale, len(obs), len(venues),
+			MinPriceVenues)
 	} else {
 		reading, err = s.oracle.Update(time.Now(), obs)
-		if err == nil && reading.Sources < MinPriceSources {
+		if err == nil && reading.Venues < MinPriceVenues {
 			// The oracle drops a reading older than its maxAge, by
 			// the source's own clock where it gives one.
 			err = fmt.Errorf("%w: %d of the price sources are recent "+
-				"enough, and %d are needed to check one against "+
-				"another", rate.ErrStale, reading.Sources,
-				MinPriceSources)
+				"enough, from %d venues, and %d venues are needed to "+
+				"check one against another", rate.ErrStale,
+				reading.Sources, reading.Venues, MinPriceVenues)
 		}
 	}
 
@@ -357,7 +367,8 @@ func (s *Service) samplePrice(ctx context.Context) {
 		return
 	}
 	s.log.Info("price", "outgoingPerIncoming", reading.OutgoingPerIncoming,
-		"sources", reading.Sources, "spread", reading.Spread)
+		"sources", reading.Sources, "venues", reading.Venues,
+		"spread", reading.Spread)
 }
 
 // readSource reads one source and says when its price is from: the source's

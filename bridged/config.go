@@ -14,7 +14,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/paulscode/lightning-fork-bridge/chainrate"
@@ -154,11 +156,11 @@ type Config struct {
 	// bridge that invents a rate when its sources are down is a bridge that
 	// pays out at a price nobody quoted.
 	//
-	// Two independent readings are required, counting CrossCheck as one,
-	// and two have to answer for a price to be quoted at all: the oracle's
-	// one defence on a thin market is readings that should agree being
-	// checked against each other, and one source has nothing to be checked
-	// against.
+	// Readings from two venues are required, counting CrossCheck as one,
+	// and two venues have to answer for a price to be quoted at all: the
+	// oracle's one defence on a thin market is readings that should agree
+	// being checked against each other, and one venue's readings agreeing
+	// with each other say nothing about that venue being moved.
 	RateSources []RateSource `json:"rateSources"`
 
 	// CrossCheck, when set, is one more reading of the price, derived from
@@ -184,6 +186,12 @@ type RateSource struct {
 
 	// URL is fetched and expected to return JSON.
 	URL string `json:"url"`
+
+	// Venue is the market the price comes from. Prices from one venue,
+	// however many, are that venue's say once: two of its books cannot
+	// check each other against the venue itself being moved. Empty means
+	// the URL's host, so two hosts of one venue need naming as one.
+	Venue string `json:"venue,omitempty"`
 
 	// Field is the JSON field holding the price, which is how many outgoing
 	// units one incoming unit buys in the BLAKE2b-to-Bitcoin direction. The
@@ -219,6 +227,18 @@ func (s RateSource) maxUnchanged() time.Duration {
 	return DefaultMaxUnchanged
 }
 
+// venue is the market a source counts as: its Venue, or its URL's host.
+func (s RateSource) venue() string {
+	if s.Venue != "" {
+		return strings.ToLower(s.Venue)
+	}
+	if u, err := url.Parse(s.URL); err == nil && u.Hostname() != "" {
+		return strings.ToLower(u.Hostname())
+	}
+
+	return s.URL
+}
+
 func (s RateSource) valid() error {
 	switch {
 	case s.Name == "":
@@ -244,9 +264,15 @@ type CrossCheck struct {
 	Name string `json:"name"`
 
 	// IncomingUSD is dollars per BTCB2, OutgoingUSD dollars per BTC. Each
-	// is read as a rate source, timestamps and all.
+	// is read as a rate source, timestamps and all. The reading counts as
+	// IncomingUSD's venue, the BTCB2 market it reads.
 	IncomingUSD RateSource `json:"incomingUSD"`
 	OutgoingUSD RateSource `json:"outgoingUSD"`
+}
+
+// venue is the market the cross-check's reading counts as.
+func (c CrossCheck) venue() string {
+	return c.IncomingUSD.venue()
 }
 
 func (c CrossCheck) valid() error {
@@ -269,9 +295,9 @@ func (c CrossCheck) valid() error {
 	return nil
 }
 
-// sources checks the price sources: at least two independent readings,
-// counting the cross-check as one, each named once and fetched from its own
-// URL.
+// sources checks the price sources: readings from at least MinPriceVenues
+// venues, counting the cross-check as one, each named once and fetched from
+// its own URL.
 func (c Config) sources() error {
 	n := len(c.RateSources)
 	if c.CrossCheck != nil {
@@ -309,8 +335,36 @@ func (c Config) sources() error {
 				"both called %q", ErrConfig, c.CrossCheck.Name)
 		}
 	}
+	if v := c.venues(); len(v) < MinPriceVenues {
+		return fmt.Errorf("%w: every price source reads %s, and %d venues "+
+			"are needed: one venue's prices cannot check each other "+
+			"against that venue being moved. Name another venue, or "+
+			"set each source's venue where one venue has several hosts",
+			ErrConfig, strings.Join(v, " and "), MinPriceVenues)
+	}
 
 	return nil
+}
+
+// venues is the distinct venues the price sources read, the cross-check as
+// its incoming price's.
+func (c Config) venues() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(v string) {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	for _, s := range c.RateSources {
+		add(s.venue())
+	}
+	if c.CrossCheck != nil {
+		add(c.CrossCheck.venue())
+	}
+
+	return out
 }
 
 // Load reads a configuration and checks it. Unknown fields are an error: a
