@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1280,5 +1281,103 @@ func TestANodeThatKeepsContradictingItselfIsRaised(t *testing.T) {
 	}
 	if _, cancelled := in.counts(); cancelled != 0 {
 		t.Error("it cancelled on a contradiction")
+	}
+}
+
+// TestARestartResumesAPayingSwapFromTheJournalOnDisk is recovery as it
+// happens: a swap recorded as paying in a journal file, the process gone, a
+// new one opening the same file. What the paying node says decides it: a
+// payment that succeeded is settled, one that failed is given back, one still
+// in flight is waited on, and one the node has no record of is left for an
+// operator, untouched.
+func TestARestartResumesAPayingSwapFromTheJournalOnDisk(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		payment   node.Payment
+		want      swap.State
+		needsHelp bool
+	}{
+		{"succeeded", node.Payment{State: node.PaymentSucceeded,
+			Preimage: preimage}, swap.Settled, false},
+		{"failed", node.Payment{State: node.PaymentFailed}, swap.Failed,
+			false},
+		{"in flight", node.Payment{State: node.PaymentInFlight},
+			swap.Paying, false},
+		{"never seen", node.Payment{State: node.PaymentNone}, swap.Paying,
+			true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "swaps.journal")
+
+			// The process that was paying: it recorded the swap and
+			// went away without closing anything.
+			before, err := store.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := before.Put(context.Background(),
+				record(swap.Paying)); err != nil {
+
+				t.Fatal(err)
+			}
+			if err := before.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			// The next one.
+			j, err := store.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer j.Close()
+
+			in := &fakeIn{
+				invoice: node.Invoice{State: node.InvoiceAccepted,
+					ExpiryHeight: 1000},
+				height: 500,
+			}
+			out := &fakeOut{lookup: c.payment}
+			r := &Runner{
+				Driver: &driver.Driver{In: in, Out: out, Store: j,
+					Policy: pol, Now: clock},
+				Store: j, Rates: rates, Poll: time.Millisecond, Now: clock,
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(),
+				200*time.Millisecond)
+			defer cancel()
+			err = r.Resume(ctx)
+			if c.needsHelp != errors.Is(err, driver.ErrNeedsOperator) {
+				t.Errorf("resume: %v", err)
+			}
+
+			final, err := j.Get(context.Background(), hash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if final.State != c.want {
+				t.Errorf("ended in %v, want %v", final.State, c.want)
+			}
+			settled, cancelled := in.counts()
+			switch c.want {
+			case swap.Settled:
+				if settled != 1 || final.Preimage != preimage {
+					t.Errorf("settled %d, preimage %x", settled,
+						final.Preimage)
+				}
+			case swap.Failed:
+				if cancelled != 1 {
+					t.Errorf("cancelled %d", cancelled)
+				}
+			default:
+				if settled != 0 || cancelled != 0 {
+					t.Errorf("settled %d, cancelled %d while the "+
+						"payment was not over", settled, cancelled)
+				}
+			}
+			if n := atomic.LoadInt32(&out.paid); n != 0 {
+				t.Errorf("paid %d times on a restart", n)
+			}
+		})
 	}
 }
