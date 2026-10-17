@@ -300,36 +300,37 @@ func (c CrossCheck) valid() error {
 // venues, counting the cross-check as one, each named once and fetched from
 // its own URL.
 func (c Config) sources() error {
+	var errs []error
 	n := len(c.RateSources)
 	if c.CrossCheck != nil {
 		n++
 	}
 	if n < 2 {
-		return fmt.Errorf("%w: %d price sources, and two are needed, "+
-			"counting crossCheck as one. There is no default: a bridge "+
-			"that invents a price pays out at one nobody quoted, and one "+
-			"that trusts a single source has nothing to check it "+
-			"against", ErrConfig, n)
+		errs = append(errs, fmt.Errorf("%w: %d price sources, and two are "+
+			"needed, counting crossCheck as one. There is no default: a "+
+			"bridge that invents a price pays out at one nobody quoted, "+
+			"and one that trusts a single source has nothing to check it "+
+			"against", ErrConfig, n))
 	}
 
 	names, urls := map[string]bool{}, map[string]bool{}
 	for _, s := range c.RateSources {
 		if err := s.valid(); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 		if names[s.Name] {
-			return fmt.Errorf("%w: two price sources are called %q",
-				ErrConfig, s.Name)
+			errs = append(errs, fmt.Errorf("%w: two price sources are "+
+				"called %q", ErrConfig, s.Name))
 		}
 		if urls[s.URL] {
-			return fmt.Errorf("%w: two price sources read %s, which is "+
-				"one source and not two", ErrConfig, s.URL)
+			errs = append(errs, fmt.Errorf("%w: two price sources read "+
+				"%s, which is one source and not two", ErrConfig, s.URL))
 		}
 		names[s.Name], urls[s.URL] = true, true
 	}
 	if c.CrossCheck != nil {
 		if err := c.CrossCheck.valid(); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 		// The unchanged-price check keys on these names, so the
 		// cross-check's two prices need names of their own too.
@@ -337,22 +338,23 @@ func (c Config) sources() error {
 			c.CrossCheck.IncomingUSD.Name, c.CrossCheck.OutgoingUSD.Name} {
 
 			if names[n] {
-				return fmt.Errorf("%w: two price sources, counting the "+
-					"cross-check and its two prices, are called %q",
-					ErrConfig, n)
+				errs = append(errs, fmt.Errorf("%w: two price sources, "+
+					"counting the cross-check and its two prices, are "+
+					"called %q", ErrConfig, n))
 			}
 			names[n] = true
 		}
 	}
-	if v := c.venues(); len(v) < MinPriceVenues {
-		return fmt.Errorf("%w: every price source reads %s, and %d venues "+
-			"are needed: one venue's prices cannot check each other "+
-			"against that venue being moved. Name another venue, or "+
-			"set each source's venue where one venue has several hosts",
-			ErrConfig, strings.Join(v, " and "), MinPriceVenues)
+	if v := c.venues(); n >= 2 && len(v) < MinPriceVenues {
+		errs = append(errs, fmt.Errorf("%w: every price source reads %s, "+
+			"and %d venues are needed: one venue's prices cannot check "+
+			"each other against that venue being moved. Name another "+
+			"venue, or set each source's venue where one venue has "+
+			"several hosts", ErrConfig, strings.Join(v, " and "),
+			MinPriceVenues))
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // venues is the distinct venues the price sources read, the cross-check as
@@ -411,82 +413,84 @@ func LoadFile(path string) (Config, error) {
 	return Load(f)
 }
 
-// Valid reports whether the daemon will run on this configuration.
+// Valid reports whether the daemon will run on this configuration, with
+// every reason it will not rather than the first: each one found at a restart
+// costs another.
 func (c Config) Valid() error {
+	var errs []error
+	add := func(err error) {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	if c.Listen == "" {
-		return fmt.Errorf("%w: no listen address", ErrConfig)
+		add(fmt.Errorf("%w: no listen address", ErrConfig))
 	}
 	if c.Journal == "" {
-		return fmt.Errorf("%w: no journal path", ErrConfig)
+		add(fmt.Errorf("%w: no journal path", ErrConfig))
 	}
-	if err := c.Blake2b.valid("the BLAKE2b node"); err != nil {
-		return err
-	}
-	if err := c.Bitcoin.valid("the Bitcoin node"); err != nil {
-		return err
-	}
+	add(c.Blake2b.valid("the BLAKE2b node"))
+	add(c.Bitcoin.valid("the Bitcoin node"))
 	if !c.ToBitcoin.Enabled && !c.ToBlake2b.Enabled {
-		return fmt.Errorf("%w: neither direction is enabled, so this "+
-			"daemon could not quote anything", ErrConfig)
+		add(fmt.Errorf("%w: neither direction is enabled, so this "+
+			"daemon could not quote anything", ErrConfig))
 	}
+
+	// reachable sizes swaps with the chains' parameters and the margin
+	// policy, so it runs only when those are usable.
+	timing := true
 	if !c.Blake2bChain.toParams().Valid() {
-		return fmt.Errorf("%w: the BLAKE2b chain's timing parameters are "+
-			"not usable", ErrConfig)
+		timing = false
+		add(fmt.Errorf("%w: the BLAKE2b chain's timing parameters are "+
+			"not usable", ErrConfig))
 	}
 	if !c.BitcoinChain.toParams().Valid() {
-		return fmt.Errorf("%w: the Bitcoin chain's timing parameters are "+
-			"not usable", ErrConfig)
+		timing = false
+		add(fmt.Errorf("%w: the Bitcoin chain's timing parameters are "+
+			"not usable", ErrConfig))
 	}
-	if err := c.Blake2bChain.measured("blake2bChain"); err != nil {
-		return err
-	}
-	if err := c.BitcoinChain.measured("bitcoinChain"); err != nil {
-		return err
-	}
+	add(c.Blake2bChain.measured("blake2bChain"))
+	add(c.BitcoinChain.measured("bitcoinChain"))
 	if !c.Margin.Valid() {
-		return fmt.Errorf("%w: the margin policy is not usable (a hold "+
+		timing = false
+		add(fmt.Errorf("%w: the margin policy is not usable (a hold "+
 			"expiry delta of %d blocks must be at least lnd's default of "+
 			"%d and under maxIncomingBlocks %d)", ErrConfig,
 			c.Margin.HoldExpiryDelta, margin.DefaultHoldExpiryDelta,
-			c.Margin.MaxIncomingBlocks)
+			c.Margin.MaxIncomingBlocks))
 	}
 	if !c.Rate.Valid() {
-		return fmt.Errorf("%w: the rate policy is not usable", ErrConfig)
+		add(fmt.Errorf("%w: the rate policy is not usable", ErrConfig))
 	}
-	if err := c.sources(); err != nil {
-		return err
-	}
+	add(c.sources())
 	if c.Limits.MaxUnpaid < 0 || c.Limits.MaxInProgress < 0 ||
 		c.Limits.PerMinute < 0 {
 
-		return fmt.Errorf("%w: a negative per-caller limit", ErrConfig)
+		add(fmt.Errorf("%w: a negative per-caller limit", ErrConfig))
 	}
-	if err := c.ToBitcoin.valid("toBitcoin"); err != nil {
-		return err
+	add(c.ToBitcoin.valid("toBitcoin"))
+	add(c.ToBlake2b.valid("toBlake2b"))
+	if timing {
+		add(c.reachable())
 	}
-	if err := c.ToBlake2b.valid("toBlake2b"); err != nil {
-		return err
-	}
-	if err := c.reachable(); err != nil {
-		return err
-	}
-	if c.Blake2b.Address == c.Bitcoin.Address {
-		return fmt.Errorf("%w: both nodes are %s, so the bridge would hold "+
+	if c.Blake2b.Address != "" && c.Blake2b.Address == c.Bitcoin.Address {
+		add(fmt.Errorf("%w: both nodes are %s, so the bridge would hold "+
 			"an invoice and pay one on the same node. The two chains need "+
-			"two nodes", ErrConfig, c.Blake2b.Address)
+			"two nodes", ErrConfig, c.Blake2b.Address))
 	}
 	// The oracle refuses an observation older than MaxAge, so polling more
 	// slowly than that guarantees every reading is stale by the daemon's own
 	// policy for most of its life, and quotes would be refused constantly
 	// for a reason the operator never chose.
-	if c.pollInterval() >= c.Rate.MaxAge {
-		return fmt.Errorf("%w: prices are polled every %v but the policy "+
+	if c.Rate.Valid() && c.pollInterval() >= c.Rate.MaxAge {
+		add(fmt.Errorf("%w: prices are polled every %v but the policy "+
 			"calls an observation stale after %v, so most quotes would be "+
 			"refused on a price that had simply not been refreshed",
-			ErrConfig, c.pollInterval(), c.Rate.MaxAge)
+			ErrConfig, c.pollInterval(), c.Rate.MaxAge))
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // MinSamplesFloor and SurgeWindowFloor are the least a chain's minSamples and
@@ -558,13 +562,10 @@ func (c Config) reachable() error {
 		return nil
 	}
 
-	if err := check("toBitcoin", c.ToBitcoin, c.Blake2bChain,
-		c.BitcoinChain); err != nil {
-
-		return err
-	}
-
-	return check("toBlake2b", c.ToBlake2b, c.BitcoinChain, c.Blake2bChain)
+	return errors.Join(
+		check("toBitcoin", c.ToBitcoin, c.Blake2bChain, c.BitcoinChain),
+		check("toBlake2b", c.ToBlake2b, c.BitcoinChain, c.Blake2bChain),
+	)
 }
 
 func (d Direction) valid(which string) error {

@@ -177,6 +177,17 @@ how the earlier attempt ended.
 measure, a node it cannot reach, or a journal that has gone. A bridge in any of those states is up and
 unable to do anything, and reporting "ok" is how that goes unnoticed.
 
+## Upgrading
+
+A configuration is checked whole at startup, and every fault is reported at
+once. This version refuses configurations the previous one ran on: each
+chain's `minSamples` must be at least 100 and `surgeWindow` at least 144, and
+the price sources must read two venues. A daemon that will not start drives
+none of the swaps in its journal, so finish them first: stop taking quotes
+and let every swap in the journal end before upgrading, or, if the new
+binary refuses the configuration with swaps still open, start the old binary
+on it again until they have finished, then fix the configuration.
+
 ## Status
 
 Built and tested: the logic that decides, the record it decides against, the

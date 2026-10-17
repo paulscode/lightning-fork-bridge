@@ -508,3 +508,29 @@ func TestPerCallerLimitsDefault(t *testing.T) {
 		t.Errorf("a negative limit: want ErrConfig, got %v", err)
 	}
 }
+
+// TestEveryConfigurationErrorIsReportedAtOnce: a configuration with several
+// faults names all of them, so fixing them takes one restart rather than one
+// each.
+func TestEveryConfigurationErrorIsReportedAtOnce(t *testing.T) {
+	t.Parallel()
+
+	bad := strings.Replace(good, `"listen": "127.0.0.1:9737"`,
+		`"listen": ""`, 1)
+	bad = strings.Replace(bad, `"minSamples": 100,`, `"minSamples": 99,`, 1)
+	bad = strings.Replace(bad, `"maxSwapMsat": 500000000`,
+		`"maxSwapMsat": 0`, 1)
+	bad = strings.Replace(bad, `"https://y/p"`, `"https://x/p"`, 1)
+
+	_, err := load(t, bad)
+	if !errors.Is(err, ErrConfig) {
+		t.Fatalf("want ErrConfig, got %v", err)
+	}
+	for _, want := range []string{"no listen address", "minSamples",
+		"maximum swap size", "one source and not two"} {
+
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not say %q: %v", want, err)
+		}
+	}
+}
