@@ -25,6 +25,7 @@ import (
 	"github.com/paulscode/lightning-fork-bridge/margin"
 	"github.com/paulscode/lightning-fork-bridge/quote"
 	"github.com/paulscode/lightning-fork-bridge/rate"
+	"github.com/paulscode/lightning-fork-bridge/runner"
 )
 
 // ErrConfig is returned for a configuration this daemon will not run on.
@@ -388,8 +389,13 @@ func (c Config) venues() []string {
 // the package's default rather than on zero.
 // HoldExpiryDelta is the one that matters: zero would count the blocks the
 // incoming node has already given up in as margin, and the policy refuses it.
+// Each direction's quote reserve starts from quote.DefaultPolicy's too: it
+// came after configurations were written, and zero, which every one of those
+// would read as, quotes an invoice for its whole remaining life.
 func Load(r io.Reader) (Config, error) {
 	c := Config{Margin: margin.DefaultPolicy, Limits: quote.DefaultLimits}
+	c.ToBitcoin.Policy.QuoteReserve = quote.DefaultPolicy.QuoteReserve
+	c.ToBlake2b.Policy.QuoteReserve = quote.DefaultPolicy.QuoteReserve
 
 	dec := json.NewDecoder(r)
 	dec.DisallowUnknownFields()
@@ -583,6 +589,15 @@ func (d Direction) valid(which string) error {
 	if d.Policy.MaxSwapMsat == 0 {
 		return fmt.Errorf("%w: %s has no maximum swap size", ErrConfig,
 			which)
+	}
+	if d.Policy.QuoteReserve < runner.DefaultGateReserve {
+		// A payer funding a quote at its last moment leaves the invoice
+		// this much, and the runner pays only with DefaultGateReserve
+		// left: less, and such a swap is funded only to be refunded.
+		return fmt.Errorf("%w: %s quotes reserve %v of the invoice's "+
+			"life, less than the %v the bridge needs left to pay it",
+			ErrConfig, which, d.Policy.QuoteReserve,
+			runner.DefaultGateReserve)
 	}
 	if d.Policy.InvoiceExpiry < d.Policy.Validity {
 		return fmt.Errorf("%w: %s quotes are valid for %v but its hold "+

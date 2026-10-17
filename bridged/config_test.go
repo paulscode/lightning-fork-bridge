@@ -78,6 +78,52 @@ func TestGoodConfigLoads(t *testing.T) {
 	}
 }
 
+// A configuration written before the quote reserve existed leaves it out, and
+// gets the quote package's 10 s rather than zero, which would quote an invoice
+// for its whole remaining life. One under the runner's gate reserve is
+// refused: a payer funding such a quote at its last moment is refunded.
+func TestTheQuoteReserveDefaultsAndCoversTheGate(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := load(t, good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for which, d := range map[string]Direction{
+		"toBitcoin": cfg.ToBitcoin, "toBlake2b": cfg.ToBlake2b,
+	} {
+		if got := d.Policy.QuoteReserve; got !=
+			quote.DefaultPolicy.QuoteReserve {
+
+			t.Errorf("%s reserve %v, want the default %v", which, got,
+				quote.DefaultPolicy.QuoteReserve)
+		}
+	}
+
+	with := func(reserve string) (Config, error) {
+		return load(t, strings.Replace(good,
+			`"minRemainingLife": 120000000000`,
+			`"minRemainingLife": 120000000000, "quoteReserve": `+
+				reserve, 1))
+	}
+	cfg, err = with("30000000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.ToBitcoin.Policy.QuoteReserve; got != 30*time.Second {
+		t.Errorf("reserve %v, want the configured 30s", got)
+	}
+	for _, reserve := range []string{"4999999999", "0"} {
+		if _, err := with(reserve); !errors.Is(err, ErrConfig) {
+			t.Errorf("a reserve of %s ns should be refused, got %v",
+				reserve, err)
+		}
+	}
+	if _, err := with("5000000000"); err != nil {
+		t.Errorf("the gate reserve itself should be accepted: %v", err)
+	}
+}
+
 // A misspelled key that is ignored leaves the daemon running on a default the
 // operator believes they overrode, which is the worst of both.
 func TestUnknownFieldsAreRefused(t *testing.T) {
