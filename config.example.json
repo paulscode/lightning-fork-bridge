@@ -16,18 +16,18 @@
     "targetSpacing": 600000000000,
     "surgeFactor": 4,
     "stallFactor": 4,
-    "minSamples": 6,
+    "minSamples": 100,
     "staleAfter": 3600000000000,
-    "surgeWindow": 12
+    "surgeWindow": 144
   },
   "bitcoinChain": {
     "retargetInterval": 2016,
     "targetSpacing": 600000000000,
     "surgeFactor": 2,
     "stallFactor": 2,
-    "minSamples": 6,
+    "minSamples": 100,
     "staleAfter": 7200000000000,
-    "surgeWindow": 12
+    "surgeWindow": 144
   },
   "margin": {
     "Settlement": 1800000000000,

@@ -134,6 +134,14 @@ has shown, while keeping an outgoing budget that suits ordinary destinations,
 does exactly that. The daemon checks the combination at startup rather than
 letting it surface as a refusal on the first quote.
 
+Block spacing is measured from block headers, read through ChainKit, which a
+stock lnd serves only when built with the `chainrpc` tag. With it, the daemon
+reads the last 150 headers of each chain at startup and is measurable in
+seconds, and the headers' difficulty carries the measurement across a
+retarget. Without it, the daemon learns from tips as they arrive and refuses
+quotes until it has `minSamples` (at least 100) blocks of the current epoch,
+which is most of a day after a start and after every retarget.
+
 The journal is append-only, so the daemon rewrites it down to each swap's
 latest record, hourly by default and only while nothing is being driven:
 compaction takes the journal's lock, and a swap blocked on writing its own

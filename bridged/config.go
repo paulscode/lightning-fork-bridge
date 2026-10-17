@@ -241,6 +241,12 @@ func (c Config) Valid() error {
 		return fmt.Errorf("%w: the Bitcoin chain's timing parameters are "+
 			"not usable", ErrConfig)
 	}
+	if err := c.Blake2bChain.measured("blake2bChain"); err != nil {
+		return err
+	}
+	if err := c.BitcoinChain.measured("bitcoinChain"); err != nil {
+		return err
+	}
 	if !c.Margin.Valid() {
 		return fmt.Errorf("%w: the margin policy is not usable (a hold "+
 			"expiry delta of %d blocks must be at least lnd's default of "+
@@ -284,6 +290,34 @@ func (c Config) Valid() error {
 			"calls an observation stale after %v, so most quotes would be "+
 			"refused on a price that had simply not been refreshed",
 			ErrConfig, c.pollInterval(), c.Rate.MaxAge)
+	}
+
+	return nil
+}
+
+// MinSamplesFloor and SurgeWindowFloor are the least a chain's minSamples and
+// surgeWindow may be: chainrate's own defaults, and the window its surge
+// factor was measured over. Fewer samples let a mean of a handful of blocks,
+// which Poisson arrivals scatter widely, set every swap's margin; a shorter
+// surge window trips on that same scatter, or with the window much shorter,
+// misses a real surge for it.
+const (
+	MinSamplesFloor  = 100
+	SurgeWindowFloor = 144
+)
+
+// measured checks the two numbers that decide how much of a chain an estimate
+// rests on.
+func (c Chain) measured(which string) error {
+	if c.MinSamples < MinSamplesFloor {
+		return fmt.Errorf("%w: %s.minSamples is %d; an estimate needs at "+
+			"least %d blocks of the current epoch to stand on its own",
+			ErrConfig, which, c.MinSamples, MinSamplesFloor)
+	}
+	if c.SurgeWindow < SurgeWindowFloor {
+		return fmt.Errorf("%w: %s.surgeWindow is %d; the surge check "+
+			"needs a window of at least %d blocks", ErrConfig, which,
+			c.SurgeWindow, SurgeWindowFloor)
 	}
 
 	return nil

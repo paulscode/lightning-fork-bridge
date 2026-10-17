@@ -232,7 +232,7 @@ func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
 		if name == "bitcoin" {
 			obs = s.btcChain
 		}
-		if _, err := obs.Estimate(time.Now()); err != nil {
+		if _, err := s.estimate(obs); err != nil {
 			out[name+"Chain"] = err.Error()
 			ready = false
 		} else {

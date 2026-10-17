@@ -20,13 +20,13 @@ const good = `{
   "bitcoin": {"address": "btc:10009", "tlsCert": "/t.cert", "macaroon": "/m"},
   "blake2bChain": {
     "retargetInterval": 2016, "targetSpacing": 600000000000,
-    "surgeFactor": 4, "stallFactor": 4, "minSamples": 6,
-    "staleAfter": 3600000000000, "surgeWindow": 12
+    "surgeFactor": 4, "stallFactor": 4, "minSamples": 100,
+    "staleAfter": 3600000000000, "surgeWindow": 144
   },
   "bitcoinChain": {
     "retargetInterval": 2016, "targetSpacing": 600000000000,
-    "surgeFactor": 2, "stallFactor": 2, "minSamples": 6,
-    "staleAfter": 7200000000000, "surgeWindow": 12
+    "surgeFactor": 2, "stallFactor": 2, "minSamples": 100,
+    "staleAfter": 7200000000000, "surgeWindow": 144
   },
   "margin": {"Settlement": 1800000000000, "MaxIncomingBlocks": 2016},
   "rate": {
@@ -150,6 +150,24 @@ func TestRefusals(t *testing.T) {
 					`"surgeFactor": 19, "stallFactor": 4`, 1)
 			},
 			want: "could not quote any swap",
+		},
+		{
+			// A mean of six blocks is what Poisson arrivals scatter
+			// widely, and it would set every swap's margin.
+			name: "too few samples",
+			edit: func(s string) string {
+				return strings.Replace(s, `"minSamples": 100,`,
+					`"minSamples": 99,`, 1)
+			},
+			want: "minSamples",
+		},
+		{
+			name: "too short a surge window",
+			edit: func(s string) string {
+				return strings.Replace(s, `"surgeWindow": 144`,
+					`"surgeWindow": 143`, 1)
+			},
+			want: "surgeWindow",
 		},
 		{
 			name: "no maximum swap size",

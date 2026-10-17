@@ -47,6 +47,8 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) serve(ctx context.Context) error {
 	// Observers first, and a moment to fill: a resumed swap is sized
 	// against block spacing, and an observer with nothing in it refuses.
+	// History first where the nodes serve it, so the wait is seconds.
+	s.backfill(ctx)
 	go s.pollChains(ctx)
 	go s.pollPrice(ctx)
 	go s.compact(ctx)
@@ -171,8 +173,8 @@ func (s *Service) waitForChains(ctx context.Context) error {
 
 	var last error
 	for {
-		_, lfErr := s.lfChain.Estimate(time.Now())
-		_, btcErr := s.btcChain.Estimate(time.Now())
+		_, lfErr := s.estimate(s.lfChain)
+		_, btcErr := s.estimate(s.btcChain)
 		if lfErr == nil && btcErr == nil {
 			return nil
 		}

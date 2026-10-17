@@ -78,6 +78,12 @@ type Service struct {
 	lfChain  *chainrate.Observer
 	btcChain *chainrate.Observer
 
+	// obsMu guards both observers; see addBlock. chainSrcs is what feeds
+	// them, built once.
+	obsMu        sync.Mutex
+	chainSrcOnce sync.Once
+	chainSrcs    []*chainSource
+
 	// price is the latest combined reading, or the error that stopped it
 	// being one. Guarded because the poller writes it and quotes read it.
 	priceMu  sync.RWMutex
@@ -381,12 +387,12 @@ func (s *Service) paysBLAKE2b(ctx context.Context, sd *side,
 // function serves both and is converted at each use.
 func (s *Service) spacing(invert bool) func(context.Context) (driver.Rates, error) {
 	return func(ctx context.Context) (driver.Rates, error) {
-		lf, err := s.lfChain.Estimate(time.Now())
+		lf, err := s.estimate(s.lfChain)
 		if err != nil {
 			return driver.Rates{}, fmt.Errorf("the BLAKE2b chain's "+
 				"spacing: %w", err)
 		}
-		btc, err := s.btcChain.Estimate(time.Now())
+		btc, err := s.estimate(s.btcChain)
 		if err != nil {
 			return driver.Rates{}, fmt.Errorf("the Bitcoin chain's "+
 				"spacing: %w", err)
