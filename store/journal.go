@@ -154,7 +154,8 @@ func (w wire) record() (Record, error) {
 // Append-only rather than update-in-place because the history is worth having:
 // when a swap ends in swap.Lost, the sequence of states it went through is the
 // evidence for which assumption failed, and an overwritten row would have
-// destroyed it. Compact discards superseded records once they are terminal.
+// destroyed it. Compact discards superseded records, keeping each swap's
+// latest.
 type Journal struct {
 	mu    sync.Mutex
 	path  string
@@ -417,8 +418,12 @@ func sortRecords(out []Record) {
 	})
 }
 
-// Compact rewrites the journal with one record per hash, dropping the history
-// of swaps that have finished.
+// Compact rewrites the journal with one record per hash: each swap's latest,
+// finished or not, without the states it passed through on the way.
+//
+// Finished swaps are kept on purpose. A quote for a hash that was swapped
+// before is decided by how that swap ended, and a record dropped here would
+// leave only the node's word for it.
 //
 // It writes a new file and renames it over the old one, so a crash part way
 // through leaves the original intact: the journal is either wholly the old

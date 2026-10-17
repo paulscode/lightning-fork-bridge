@@ -432,7 +432,7 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 	// A second hold invoice for a hash that already has a live one would let
 	// the same preimage claim twice, and would leave two records fighting
 	// over one swap. Refuse before anything is created. A swap that ended
-	// without paying is different, and see again below.
+	// before anyone funded it is different: see previous.
 	forget, err := q.previous(ctx, dec.Hash)
 	if err != nil {
 		return Quote{}, err
@@ -559,22 +559,36 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 // new quote. It reports whether the previous attempt's cancelled invoice must
 // be deleted before a new one can be created.
 //
-// At most one swap per hash may be live. One that ended without paying the
-// invoice (failed, aborted, expired) gave the payer's money back, so quoting
-// again is safe and is the only way that invoice can ever be paid through this
-// bridge: the node keeps the cancelled hold invoice and would refuse a second
-// one for the same hash. The node is asked as well as the journal, because
-// compacting the journal drops finished swaps while the node keeps their
-// invoices.
+// At most one swap per hash may be live. One that ended before anyone paid
+// its hold invoice gave nothing away and holds nothing, so quoting again is
+// safe and is the only way that invoice can ever be paid through this bridge:
+// the node keeps the cancelled hold invoice and would refuse a second one for
+// the same hash.
+//
+// One whose hold invoice was funded is different, however it ended. Failed
+// and aborted swaps are only reachable through Funded, and an expired one
+// whose cancelled invoice shows an HTLC was paid at the last moment. The
+// payer's money came back in each case, but the bridge does not put a second
+// invoice under a hash an earlier one was funded under: it refuses with
+// ErrFundedBefore, and the recipient issues a new invoice.
+//
+// The node is asked as well as the journal. Compaction keeps each swap's
+// latest record, finished or not, and this depends on that; but a journal
+// started afresh, or a hash quoted by something else, leaves only the node's
+// invoice to go on, and its HTLCs say whether it was funded.
 func (q *Quoter) previous(ctx context.Context, hash node.Hash) (bool, error) {
 	rec, err := q.Store.Get(ctx, hash)
 	switch {
 	case err == nil:
 		switch rec.State {
-		case swap.Failed, swap.Aborted, swap.Expired:
-			// Ended unpaid. The node is still asked below, because
-			// the record could say expired while the invoice was
-			// never cancelled, and that must not be deleted.
+		case swap.Expired:
+			// Ended unpaid, as far as the record knows. The node is
+			// still asked below, because the record could say expired
+			// while the invoice was never cancelled, which must not be
+			// deleted, or while it was funded as it was being cancelled.
+		case swap.Failed, swap.Aborted:
+			return false, fmt.Errorf("%w: %w: %w: %x was %v", ErrRefused,
+				ErrDuplicate, ErrFundedBefore, hash, rec.State)
 		case swap.Settled:
 			return false, fmt.Errorf("%w: %w: %w: %x", ErrRefused,
 				ErrDuplicate, ErrAlreadyPaid, hash)
@@ -603,6 +617,14 @@ func (q *Quoter) previous(ctx context.Context, hash node.Hash) (bool, error) {
 
 	switch inv.State {
 	case node.InvoiceCancelled:
+		if inv.HTLCs > 0 {
+			// Cancelled after a payer's HTLC was locked in: funded,
+			// whatever the record says.
+			return false, fmt.Errorf("%w: %w: %w: the node's cancelled "+
+				"invoice for %x held %d HTLCs", ErrRefused, ErrDuplicate,
+				ErrFundedBefore, hash, inv.HTLCs)
+		}
+
 		return true, nil
 	case node.InvoiceSettled:
 		return false, fmt.Errorf("%w: %w: %w: %x", ErrRefused, ErrDuplicate,

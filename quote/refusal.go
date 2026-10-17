@@ -57,6 +57,13 @@ var (
 	// ErrAlreadyPaid: a swap for this payment hash settled.
 	ErrAlreadyPaid = errors.New("a swap for this payment hash was paid")
 
+	// ErrFundedBefore: an earlier attempt to pay this invoice was funded
+	// and ended without paying it. The payer's money came back, but the
+	// bridge never holds a second invoice under a hash an earlier one was
+	// funded under, so the recipient has to issue a new invoice.
+	ErrFundedBefore = errors.New("an earlier attempt to pay this invoice " +
+		"was funded; ask the recipient for a new invoice")
+
 	// ErrNeedsOperator: a swap for this payment hash ended in a way only the
 	// operator can resolve.
 	ErrNeedsOperator = errors.New("a swap for this payment hash needs " +
@@ -96,6 +103,7 @@ const (
 	CodeChainUnmeasured  Code = "chain_unmeasured"
 	CodeInProgress       Code = "in_progress"
 	CodeAlreadyPaid      Code = "already_paid"
+	CodeFundedBefore     Code = "funded_before"
 	CodeNeedsOperator    Code = "needs_operator"
 	CodeLimit            Code = "limit"
 	CodeUnavailable      Code = "unavailable"
@@ -137,6 +145,8 @@ func CodeOf(err error) Code {
 		return CodeAlreadyPaid
 	case errors.Is(err, ErrNeedsOperator):
 		return CodeNeedsOperator
+	case errors.Is(err, ErrFundedBefore):
+		return CodeFundedBefore
 	case errors.Is(err, ErrInProgress), errors.Is(err, ErrDuplicate):
 		return CodeInProgress
 

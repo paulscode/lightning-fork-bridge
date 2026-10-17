@@ -154,6 +154,10 @@ func translateInvoice(inv *lnrpc.Invoice) node.Invoice {
 	}
 	out.ExpiryHeight = earliest
 
+	// Every HTLC the node recorded, in any state: lnd keeps a cancelled one
+	// on the invoice, and that is the evidence an invoice was funded once.
+	out.HTLCs = len(inv.GetHtlcs())
+
 	return out
 }
 

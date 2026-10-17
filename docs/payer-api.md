@@ -168,7 +168,8 @@ payer when an attempt has ended so it may try again.
 `preimage` is always present, as an empty string until the swap has one: test
 for an empty value, not for the key. A participant sees only the swaps quoted
 under their own bridge code; any other hash is `not_found`.
-| `failed`, `aborted`, `expired` | Ended without paying the invoice. Any hold-invoice payment came back. The invoice may be quoted again. |
+| `failed`, `aborted` | Ended without paying the invoice after the hold invoice was paid. The payment came back. The invoice cannot be quoted again (`funded_before`); ask the recipient for a new one. |
+| `expired` | Ended without paying the invoice, usually before the hold invoice was paid. Any payment came back. The invoice may be quoted again unless the hold invoice had been paid (`funded_before`). |
 | `lost` | Ended in a way the operator has to resolve. Not something a payer can act on. |
 
 ## 3. Refusals
@@ -196,6 +197,7 @@ A payer branches on the code and may show the sentence.
 | `in_progress` | 409 | A swap for this payment hash is still in progress. |
 | `already_paid` | 409 | A swap for this payment hash settled. `/v2/bridge/swap` has the preimage. |
 | `needs_operator` | 409 | A swap for this payment hash ended in a way only the operator can resolve. |
+| `funded_before` | 409 | An earlier attempt to pay this invoice was funded and ended without paying it. Ask the recipient for a new invoice. |
 | `limit` | 429 | This participant has too many quotes outstanding, or is quoting too fast. |
 | `not_found` | 404 | No swap with that hash. |
 | `internal` | 500 | Anything else. |
@@ -208,11 +210,14 @@ authentication error, not one of these codes.
 
 ## 4. Quoting the same invoice again
 
-At most one swap per payment hash is live at a time. Once a swap has ended
-without paying (`failed`, `aborted`, `expired`), a new quote for the same
-invoice is allowed: the bridge deletes the cancelled hold invoice and starts
-afresh. While one is live the answer is `in_progress`; once one has settled it
-is `already_paid`.
+At most one swap per payment hash is live at a time. Once a swap has expired
+before anyone paid its hold invoice, a new quote for the same invoice is
+allowed: the bridge deletes the cancelled hold invoice and starts afresh. Once
+a hold invoice for the hash has been paid, the hash is never quoted again, even
+though the attempt ended and the payment came back (`failed`, `aborted`, or
+`expired` with a payment that arrived as it was being cancelled): the answer is
+`funded_before`, and the recipient has to issue a new invoice. While one is
+live the answer is `in_progress`; once one has settled it is `already_paid`.
 
 ## 5. Limits per participant
 

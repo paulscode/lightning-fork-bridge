@@ -146,8 +146,8 @@ type Config struct {
 	// Zero means thirty seconds.
 	PollInterval time.Duration `json:"pollInterval,omitempty"`
 
-	// CompactInterval is how often the journal is rewritten without the
-	// swaps that have finished. Zero means an hour. The journal is
+	// CompactInterval is how often the journal is rewritten down to each
+	// swap's latest record. Zero means an hour. The journal is
 	// append-only, so without this it grows for as long as the daemon runs
 	// and is replayed in full at every start.
 	CompactInterval time.Duration `json:"compactInterval,omitempty"`

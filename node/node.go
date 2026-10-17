@@ -130,6 +130,16 @@ type Invoice struct {
 	//
 	// It is zero while no HTLC is locked in.
 	ExpiryHeight int32
+
+	// HTLCs is how many HTLCs the node ever accepted for this invoice,
+	// whatever became of them since: held, settled or cancelled. Zero
+	// means no payer's HTLC was ever locked in.
+	//
+	// A quote reads it on a cancelled invoice, where the state alone does
+	// not say whether anyone paid it: an invoice that lapsed unpaid and one
+	// that was funded and then given back are both cancelled. Only the
+	// first may be replaced by a new invoice for the same hash.
+	HTLCs int
 }
 
 // PaymentState is what an outgoing payment is doing.

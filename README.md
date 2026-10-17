@@ -134,11 +134,13 @@ has shown, while keeping an outgoing budget that suits ordinary destinations,
 does exactly that. The daemon checks the combination at startup rather than
 letting it surface as a refusal on the first quote.
 
-The journal is append-only, so the daemon rewrites it without the swaps that
-have finished, hourly by default and only while nothing is being driven:
+The journal is append-only, so the daemon rewrites it down to each swap's
+latest record, hourly by default and only while nothing is being driven:
 compaction takes the journal's lock, and a swap blocked on writing its own
 state is a swap that is not watching an HTLC. Without that it grows for as long
-as the daemon runs and is replayed in full at every start.
+as the daemon runs and is replayed in full at every start. Finished swaps keep
+their last record, because a new quote for the same payment hash is decided by
+how the earlier attempt ended.
 
 `GET /health` answers 503 when there is no usable price, a chain it cannot
 measure, a node it cannot reach, or a journal that has gone. A bridge in any of those states is up and
@@ -184,8 +186,10 @@ journal here, it is something that happened.
 Since then, three things changed what a quote does. A direction is chosen by
 whether the invoice sets `option_blake2b`, because both chains' invoices now
 share a prefix and both nodes read every one. An invoice whose earlier attempt
-ended without paying it can be quoted again, which deletes the cancelled hold
-invoice first, since a node refuses a second invoice for the same hash. And a
+expired before anyone paid it can be quoted again, which deletes the cancelled
+hold invoice first, since a node refuses a second invoice for the same hash;
+one whose earlier attempt was funded is refused as `funded_before`, and the
+recipient has to issue a new invoice. And a
 funded swap that cannot be paid within a grace period of its quote's expiry is
 given back rather than paid late. Refusals carry stable codes, and each
 participant can be limited separately. `docs/payer-api.md` is what a wallet

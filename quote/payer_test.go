@@ -113,6 +113,10 @@ func TestEveryRefusalHasItsCode(t *testing.T) {
 		{"already paid", func(q *Quoter, d *node.Decoded, in *fakeIn) {
 			in.existing = &node.Invoice{State: node.InvoiceSettled}
 		}, CodeAlreadyPaid},
+		{"funded before", func(q *Quoter, d *node.Decoded, in *fakeIn) {
+			in.existing = &node.Invoice{State: node.InvoiceCancelled,
+				HTLCs: 1}
+		}, CodeFundedBefore},
 		{"held by something else", func(q *Quoter, d *node.Decoded,
 			in *fakeIn) {
 
@@ -202,43 +206,89 @@ func endAs(t *testing.T, st *store.Memory, in *fakeIn, state swap.State) {
 }
 
 // TestAnEndedSwapCanBeQuotedAgain is the reason the rule exists: without it an
-// invoice whose first attempt failed could never be paid through the bridge,
-// because the node keeps the cancelled hold invoice and refuses a second one
-// for the same hash.
+// invoice whose first attempt expired unpaid could never be paid through the
+// bridge, because the node keeps the cancelled hold invoice and refuses a
+// second one for the same hash.
 func TestAnEndedSwapCanBeQuotedAgain(t *testing.T) {
 	ctx := context.Background()
 
-	for _, state := range []swap.State{swap.Failed, swap.Aborted,
-		swap.Expired} {
+	in := &fakeIn{}
+	q, st := build(t, in, &fakeOut{decoded: decoded()}, 0.01)
+	if _, err := q.Quote(ctx, "lnbc1x"); err != nil {
+		t.Fatal(err)
+	}
+	endAs(t, st, in, swap.Expired)
+	first := in.asked
 
-		t.Run(state.String(), func(t *testing.T) {
+	got, err := q.Quote(ctx, "lnbc1x")
+	if err != nil {
+		t.Fatalf("an invoice whose attempt expired unpaid could not be "+
+			"quoted again: %v", err)
+	}
+	if in.forgotten != 1 {
+		t.Errorf("the cancelled invoice was forgotten %d times, want once",
+			in.forgotten)
+	}
+	if in.asked == first {
+		t.Error("no new hold invoice was created")
+	}
+
+	rec, _ := st.Get(ctx, hash)
+	if rec.State != swap.Offered {
+		t.Errorf("the new attempt is %v, want offered", rec.State)
+	}
+	if rec.IncomingMsat != got.IncomingMsat {
+		t.Error("the record does not carry the new terms")
+	}
+}
+
+// TestAFundedSwapIsNeverQuotedAgain: an attempt whose hold invoice was funded
+// spends the hash, however it ended. Failed and aborted are only reachable
+// through funded; an expired one counts when the node's cancelled invoice
+// shows an HTLC. Each is refused as funded_before and the earlier invoice is
+// left where it is.
+func TestAFundedSwapIsNeverQuotedAgain(t *testing.T) {
+	ctx := context.Background()
+
+	for _, c := range []struct {
+		state swap.State
+		htlcs int
+	}{
+		{swap.Failed, 1},
+		{swap.Aborted, 1},
+		// The record alone decides these two: a node whose invoice
+		// shows nothing does not make a funded attempt unfunded.
+		{swap.Failed, 0},
+		{swap.Aborted, 0},
+		{swap.Expired, 1},
+	} {
+		name := fmt.Sprintf("%v with %d HTLCs", c.state, c.htlcs)
+		t.Run(name, func(t *testing.T) {
 			in := &fakeIn{}
 			q, st := build(t, in, &fakeOut{decoded: decoded()}, 0.01)
 			if _, err := q.Quote(ctx, "lnbc1x"); err != nil {
 				t.Fatal(err)
 			}
-			endAs(t, st, in, state)
+			endAs(t, st, in, c.state)
+			in.existing.HTLCs = c.htlcs
 			first := in.asked
 
-			got, err := q.Quote(ctx, "lnbc1x")
-			if err != nil {
-				t.Fatalf("an invoice whose attempt %v could not be "+
-					"quoted again: %v", state, err)
+			_, err := q.Quote(ctx, "lnbc1x")
+			if !errors.Is(err, ErrFundedBefore) {
+				t.Fatalf("want ErrFundedBefore, got %v", err)
 			}
-			if in.forgotten != 1 {
-				t.Errorf("the cancelled invoice was forgotten %d times, "+
-					"want once", in.forgotten)
+			if got := CodeOf(err); got != CodeFundedBefore {
+				t.Errorf("code %q, want %q", got, CodeFundedBefore)
 			}
-			if in.asked == first {
-				t.Error("no new hold invoice was created")
+			if in.forgotten != 0 {
+				t.Error("the funded attempt's invoice was forgotten")
 			}
-
+			if in.asked != first {
+				t.Error("a new hold invoice was created")
+			}
 			rec, _ := st.Get(ctx, hash)
-			if rec.State != swap.Offered {
-				t.Errorf("the new attempt is %v, want offered", rec.State)
-			}
-			if rec.IncomingMsat != got.IncomingMsat {
-				t.Error("the record does not carry the new terms")
+			if rec.State != c.state {
+				t.Errorf("the earlier record became %v", rec.State)
 			}
 		})
 	}
@@ -281,24 +331,29 @@ func TestALiveOrSettledSwapIsNotQuotedAgain(t *testing.T) {
 	}
 }
 
-// TestACompactedSwapIsJudgedByTheNode: compacting the journal drops finished
-// swaps while the node keeps their invoices, so the node has to be asked.
+// TestACompactedSwapIsJudgedByTheNode: with no record of the hash, as after a
+// journal started afresh, the node's invoice is all there is to go on, and its
+// HTLCs say whether an earlier attempt was funded.
 func TestACompactedSwapIsJudgedByTheNode(t *testing.T) {
 	ctx := context.Background()
 
 	cases := []struct {
 		state  node.InvoiceState
+		htlcs  int
 		want   Code
 		forget int
 	}{
-		{node.InvoiceCancelled, "", 1},
-		{node.InvoiceSettled, CodeAlreadyPaid, 0},
-		{node.InvoiceOpen, CodeInProgress, 0},
-		{node.InvoiceAccepted, CodeInProgress, 0},
+		{node.InvoiceCancelled, 0, "", 1},
+		{node.InvoiceCancelled, 1, CodeFundedBefore, 0},
+		{node.InvoiceSettled, 0, CodeAlreadyPaid, 0},
+		{node.InvoiceOpen, 0, CodeInProgress, 0},
+		{node.InvoiceAccepted, 1, CodeInProgress, 0},
 	}
 	for _, c := range cases {
-		t.Run(c.state.String(), func(t *testing.T) {
-			in := &fakeIn{existing: &node.Invoice{State: c.state}}
+		name := fmt.Sprintf("%v with %d HTLCs", c.state, c.htlcs)
+		t.Run(name, func(t *testing.T) {
+			in := &fakeIn{existing: &node.Invoice{State: c.state,
+				HTLCs: c.htlcs}}
 			q, _ := build(t, in, &fakeOut{decoded: decoded()}, 0.01)
 
 			_, err := q.Quote(ctx, "lnbc1x")

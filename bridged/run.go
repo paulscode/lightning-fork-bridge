@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-// DefaultCompactInterval is how often the journal is rewritten without the
-// swaps that have finished.
+// DefaultCompactInterval is how often the journal is rewritten down to each
+// swap's latest record.
 const DefaultCompactInterval = time.Hour
 
 // Run starts the daemon and blocks until ctx ends or the listener fails.
@@ -115,8 +115,9 @@ func (s *Service) active() int {
 	return n
 }
 
-// compact rewrites the journal without the swaps that have finished, until
-// ctx ends.
+// compact rewrites the journal down to each swap's latest record, until ctx
+// ends. Finished swaps keep theirs: a new quote for the same hash is judged by
+// how the last attempt ended.
 //
 // The journal is append-only, so every state a swap passes through is another
 // line, and a daemon that runs for months replays all of them at startup.

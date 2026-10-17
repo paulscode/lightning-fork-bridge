@@ -270,6 +270,46 @@ func TestExpiryIsTheEarliestAcceptedHTLC(t *testing.T) {
 	}
 }
 
+// TestACancelledInvoiceStillShowsItWasFunded: a quote may replace a cancelled
+// invoice only if nobody ever paid it, and the state alone does not say: an
+// invoice that lapsed unpaid and one funded and then given back are both
+// cancelled. lnd keeps the given-back HTLC on the invoice, so every HTLC in
+// any state is counted.
+func TestACancelledInvoiceStillShowsItWasFunded(t *testing.T) {
+	ctx := context.Background()
+
+	for _, c := range []struct {
+		name  string
+		htlcs []*lnrpc.InvoiceHTLC
+		want  int
+	}{
+		{"never paid", nil, 0},
+		{"funded and given back", []*lnrpc.InvoiceHTLC{
+			{ExpiryHeight: 900, State: lnrpc.InvoiceHTLCState_CANCELED},
+		}, 1},
+		{"two parts given back", []*lnrpc.InvoiceHTLC{
+			{ExpiryHeight: 900, State: lnrpc.InvoiceHTLCState_CANCELED},
+			{ExpiryHeight: 910, State: lnrpc.InvoiceHTLCState_CANCELED},
+		}, 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := &fakeNode{info: synced, invoice: &lnrpc.Invoice{
+				State: lnrpc.Invoice_CANCELED, ValueMsat: 1000,
+				Htlcs: c.htlcs,
+			}}
+			in := NewIncoming(serve(t, f))
+
+			got, err := in.LookupInvoice(ctx, node.Hash{1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.HTLCs != c.want {
+				t.Errorf("%d HTLCs, want %d", got.HTLCs, c.want)
+			}
+		})
+	}
+}
+
 func TestInvoiceStatesTranslate(t *testing.T) {
 	ctx := context.Background()
 
