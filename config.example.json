@@ -34,6 +34,11 @@
     "MaxIncomingBlocks": 2016,
     "HoldExpiryDelta": 18
   },
+  "limits": {
+    "MaxUnpaid": 2,
+    "MaxInProgress": 4,
+    "PerMinute": 6
+  },
   "rate": {
     "maxAge": 300000000000,
     "maxDisagreement": 0.02,

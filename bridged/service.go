@@ -245,6 +245,7 @@ func (s *Service) build(name string, d Direction, inConn, outConn *grpc.ClientCo
 		Policy:      d.Policy,
 		PaysBLAKE2b: sd.paysBLAKE2b,
 		Own:         own,
+		Limits:      s.cfg.Limits,
 	}
 	sd.runner = &runner.Runner{
 		Driver: &driver.Driver{

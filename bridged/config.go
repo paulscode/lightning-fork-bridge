@@ -134,6 +134,16 @@ type Config struct {
 	// Margin is the HTLC timing policy both directions are sized against.
 	Margin margin.Policy `json:"margin"`
 
+	// Limits bounds each caller of POST /quote on their own, a caller
+	// being the address the request came from: how many unpaid quotes and
+	// unfinished swaps it may hold, and how many quotes it may ask for in
+	// a minute. Absent, quote.DefaultLimits; a zero field means no limit.
+	//
+	// Behind a reverse proxy every request comes from the proxy, so every
+	// caller shares one set of limits, and limiting per user is the
+	// proxy's to do.
+	Limits quote.Limits `json:"limits"`
+
 	// Rate is how the price is combined and when to stop trusting it. Its
 	// volatilityMultiple and maxSpread size the spread added for the
 	// market's move; its baseSpread does not price swaps, since the
@@ -307,12 +317,13 @@ func (c Config) sources() error {
 // misspelled policy key that is silently ignored leaves the daemon running on
 // a default the operator thought they had overridden.
 //
-// The margin policy starts from margin.DefaultPolicy, so a configuration that
-// leaves a margin field out runs on the package's default rather than on zero.
+// The margin policy starts from margin.DefaultPolicy, and the per-caller limits
+// from quote.DefaultLimits, so a configuration that leaves a field out runs on
+// the package's default rather than on zero.
 // HoldExpiryDelta is the one that matters: zero would count the blocks the
 // incoming node has already given up in as margin, and the policy refuses it.
 func Load(r io.Reader) (Config, error) {
-	c := Config{Margin: margin.DefaultPolicy}
+	c := Config{Margin: margin.DefaultPolicy, Limits: quote.DefaultLimits}
 
 	dec := json.NewDecoder(r)
 	dec.DisallowUnknownFields()
@@ -381,6 +392,11 @@ func (c Config) Valid() error {
 	}
 	if err := c.sources(); err != nil {
 		return err
+	}
+	if c.Limits.MaxUnpaid < 0 || c.Limits.MaxInProgress < 0 ||
+		c.Limits.PerMinute < 0 {
+
+		return fmt.Errorf("%w: a negative per-caller limit", ErrConfig)
 	}
 	if err := c.ToBitcoin.valid("toBitcoin"); err != nil {
 		return err

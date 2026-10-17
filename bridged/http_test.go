@@ -555,3 +555,54 @@ func TestAnUntrackedSwapIsDriven(t *testing.T) {
 	t.Fatalf("the untracked swap was left %v; it should have been driven "+
 		"to expired", rec.State)
 }
+
+// TestEachCallerHasItsOwnLimits: a quote commits the bridge's money and costs
+// the caller nothing until it pays, so each address that asks is limited on
+// its own. One over its limit is told so with 429, while another address is
+// unaffected; the swap records which address asked.
+func TestEachCallerHasItsOwnLimits(t *testing.T) {
+	t.Parallel()
+
+	s := quotableService(t)
+	s.sides[0].quoter.Limits = quote.Limits{PerMinute: 1}
+	h := s.Handler()
+
+	from := func(addr string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/quote",
+			strings.NewReader(`{"invoice":"lnbcrt1500n1p4invoice"}`))
+		req.RemoteAddr = addr
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+
+		return w
+	}
+
+	if w := from("192.0.2.1:4000"); w.Code != http.StatusOK {
+		t.Fatalf("the first quote: %d %s", w.Code, w.Body.String())
+	}
+	rec, err := s.journal.Get(context.Background(), testHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Participant != "addr:192.0.2.1" {
+		t.Errorf("recorded as %q", rec.Participant)
+	}
+
+	// The same address on another connection is the same caller.
+	w := from("192.0.2.1:4001")
+	if w.Code != http.StatusTooManyRequests ||
+		!strings.Contains(w.Body.String(), `"limit"`) {
+
+		t.Errorf("a second quote in the minute: %d %s", w.Code,
+			w.Body.String())
+	}
+
+	// Another address is not limited by the first. It is refused only
+	// because the invoice already has a swap.
+	w = from("198.51.100.7:4000")
+	if w.Code != http.StatusConflict ||
+		!strings.Contains(w.Body.String(), `"in_progress"`) {
+
+		t.Errorf("another caller: %d %s", w.Code, w.Body.String())
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -137,7 +138,7 @@ func (s *Service) handleQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	terms, err := sd.quoter.Quote(ctx, req.Invoice)
+	terms, err := sd.quoter.QuoteFor(ctx, caller(r), req.Invoice)
 	if err != nil {
 		// The record exists and the invoice may: drive it, so that it
 		// either catches up or expires rather than holding its amount
@@ -150,7 +151,10 @@ func (s *Service) handleQuote(w http.ResponseWriter, r *http.Request) {
 		// close to expiry, not enough headroom. It is the user's to act
 		// on, so it is a 4xx with the reason intact.
 		code := http.StatusBadGateway
-		if errors.Is(err, quote.ErrRefused) {
+		switch {
+		case quote.CodeOf(err) == quote.CodeLimit:
+			code = http.StatusTooManyRequests
+		case errors.Is(err, quote.ErrRefused):
 			code = http.StatusConflict
 		}
 		writeRefusal(w, code, err)
@@ -170,6 +174,23 @@ func (s *Service) handleQuote(w http.ResponseWriter, r *http.Request) {
 		Rate: terms.Rate, Spread: terms.Spread, CLTVDelta: terms.CLTVDelta,
 		Direction: sd.name, ExpiresAt: terms.Expires,
 	})
+}
+
+// caller is who a quote request is from, for its limits: the address it came
+// from, without the port, which changes with every connection. It is what the
+// swap's record carries as its participant.
+func caller(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if host == "" {
+		// Never the operator's empty participant, which is not
+		// limited.
+		return "unknown"
+	}
+
+	return "addr:" + host
 }
 
 func (s *Service) handleSwap(w http.ResponseWriter, r *http.Request) {

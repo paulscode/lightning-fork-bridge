@@ -118,7 +118,10 @@ error found later costs whatever was in flight.
 
 There is no authentication. A quote commits the bridge's money, so this belongs
 on loopback or behind something that authenticates, and a weak scheme here
-would be worse than saying so plainly.
+would be worse than saying so plainly. Each address that asks for quotes is
+limited on its own (`limits`: unpaid quotes, unfinished swaps, quotes per
+minute), which bounds what one caller can reserve; behind a proxy every caller
+is the proxy's address, and limiting per user is the proxy's job.
 
 Which direction a request is depends on the invoice, and the daemon works that
 out by asking each paying node to decode it rather than by parsing it here. The

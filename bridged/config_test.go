@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/paulscode/lightning-fork-bridge/margin"
+	"github.com/paulscode/lightning-fork-bridge/quote"
 )
 
 // good is a configuration that loads, so each test can break exactly one
@@ -451,5 +452,25 @@ func TestACrossCheckCountsAsASource(t *testing.T) {
 		`"https://z/b", "field": "p"`, 1)
 	if _, err := load(t, same); !errors.Is(err, ErrConfig) {
 		t.Errorf("a cross-check reading one price twice loaded: %v", err)
+	}
+}
+
+// TestPerCallerLimitsDefault: a configuration that sets no limits gets
+// quote.DefaultLimits rather than none, and a negative one is refused.
+func TestPerCallerLimitsDefault(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := load(t, good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits != quote.DefaultLimits {
+		t.Errorf("limits %+v, want %+v", cfg.Limits, quote.DefaultLimits)
+	}
+
+	_, err = load(t, strings.Replace(good, `"rateSources"`,
+		`"limits": {"PerMinute": -1}, "rateSources"`, 1))
+	if !errors.Is(err, ErrConfig) {
+		t.Errorf("a negative limit: want ErrConfig, got %v", err)
 	}
 }
