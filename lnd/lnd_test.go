@@ -65,6 +65,10 @@ type fakeNode struct {
 	sendReq   *routerrpc.SendPaymentRequest
 	streamErr error
 	trackErr  error
+
+	// tracked, when set, is what a Track stream emits instead of payments:
+	// a node whose payment record is not what the send stream showed.
+	tracked []*lnrpc.Payment
 }
 
 func (f *fakeNode) GetInfo(context.Context, *lnrpc.GetInfoRequest) (
@@ -146,6 +150,15 @@ func (f *fakeNode) TrackPaymentV2(_ *routerrpc.TrackPaymentRequest,
 
 	if f.trackErr != nil {
 		return f.trackErr
+	}
+	if f.tracked != nil {
+		for _, p := range f.tracked {
+			if err := stream.Send(p); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	}
 
 	return f.stream(stream)
@@ -1086,5 +1099,90 @@ func TestForgettingIsSafeToRepeat(t *testing.T) {
 	in := NewIncoming(serve(t, f))
 	if err := in.ForgetInvoice(ctx, node.Hash{9}); err == nil {
 		t.Fatal("a failed delete of an invoice still there must be reported")
+	}
+}
+
+// TestARefusalBeforeThePaymentExistsIsNotSent: lnd turns away a request it
+// cannot use (a CLTV limit the final hop and its padding do not fit, say)
+// before any payment record exists, and the swap must go back to funded
+// rather than wait in paying on a node with no record of it. Both halves are
+// needed: a status the handler sends before dispatch, and no payment for the
+// hash when asked afterwards. Anything less is in flight.
+func TestARefusalBeforeThePaymentExistsIsNotSent(t *testing.T) {
+	ctx := context.Background()
+	hashHex := hex.EncodeToString(make([]byte, 32))
+	notFound := status.Error(codes.NotFound, "payment isn't initiated")
+
+	for _, c := range []struct {
+		name     string
+		updates  []*lnrpc.Payment
+		sendErr  error
+		trackErr error
+		tracked  []*lnrpc.Payment
+		notSent  bool
+	}{
+		{"an unusable request, no record", nil,
+			status.Error(codes.Unknown, "cltv limit 40 should be "+
+				"greater than 40"), notFound, nil, true},
+		{"an invalid argument, no record", nil,
+			status.Error(codes.InvalidArgument, "invalid request"),
+			notFound, nil, true},
+		{"already in flight, no record", nil,
+			status.Error(codes.AlreadyExists, "payment is in transition"),
+			notFound, nil, true},
+		{"a refusal, and a record of the payment", nil,
+			status.Error(codes.Unknown, "something"), nil,
+			[]*lnrpc.Payment{pmt(lnrpc.Payment_IN_FLIGHT,
+				node.Preimage{})}, false},
+		{"a refusal, and a node that cannot say", nil,
+			status.Error(codes.Unknown, "something"),
+			status.Error(codes.Unavailable, "restarting"), nil, false},
+		{"a refusal after an update", []*lnrpc.Payment{
+			pmt(lnrpc.Payment_IN_FLIGHT, node.Preimage{}),
+		}, status.Error(codes.Unknown, "something"), notFound, nil,
+			false},
+		{"a lost connection, no record", nil,
+			status.Error(codes.Unavailable, "connection reset"),
+			notFound, nil, false},
+		{"a deadline, no record", nil,
+			status.Error(codes.DeadlineExceeded, "deadline"), notFound,
+			nil, false},
+		{"cancelled, no record", nil,
+			status.Error(codes.Canceled, "context canceled"), notFound,
+			nil, false},
+		{"internal, no record", nil,
+			status.Error(codes.Internal, "stream broke"), notFound, nil,
+			false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := &fakeNode{info: synced, payments: c.updates,
+				streamErr: c.sendErr, trackErr: c.trackErr,
+				tracked: c.tracked,
+				payreq: &lnrpc.PayReq{PaymentHash: hashHex,
+					NumMsat: 1000}}
+			out := NewOutgoing(serve(t, f))
+
+			got, err := out.Pay(ctx, node.PayRequest{
+				Invoice: "lnbc1fake", CLTVLimit: 40,
+				MaxFeeMsat: 5000, Timeout: 30 * time.Second,
+			})
+			if c.notSent {
+				if !errors.Is(err, node.ErrNotSent) {
+					t.Fatalf("want ErrNotSent, got %v (%v)", err,
+						got.State)
+				}
+
+				return
+			}
+			if errors.Is(err, node.ErrNotSent) {
+				t.Fatalf("read as never sent: %v", err)
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.State != node.PaymentInFlight {
+				t.Errorf("state %v, want in flight", got.State)
+			}
+		})
 	}
 }

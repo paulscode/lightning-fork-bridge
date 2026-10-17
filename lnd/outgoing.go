@@ -45,6 +45,9 @@ var _ node.Outgoing = (*Outgoing)(nil)
 // time. That distinction is the point: an HTLC that has left is out there
 // whatever this call reports, and the only safe reading of "I stopped waiting"
 // is "I do not know yet".
+//
+// It returns an error wrapping node.ErrNotSent only for a call the node turned
+// away before any payment existed; see neverSent.
 func (o *Outgoing) Pay(ctx context.Context, req node.PayRequest) (node.Payment,
 	error) {
 
@@ -83,6 +86,11 @@ func (o *Outgoing) Pay(ctx context.Context, req node.PayRequest) (node.Payment,
 		CltvLimit:      int32(req.CLTVLimit),
 	})
 	if err != nil {
+		if o.neverSent(ctx, req.Invoice, err) {
+			return node.Payment{}, fmt.Errorf("sending: %w: %w",
+				node.ErrNotSent, err)
+		}
+
 		return node.Payment{}, fmt.Errorf("sending: %w", err)
 	}
 
@@ -90,11 +98,18 @@ func (o *Outgoing) Pay(ctx context.Context, req node.PayRequest) (node.Payment,
 	// rather than from the zero value means a stream that dies early cannot
 	// be read as "never started".
 	last := node.Payment{State: node.PaymentInFlight}
-	for {
+	for received := false; ; received = true {
 		update, err := stream.Recv()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return last, nil
+			}
+
+			// Refused before the node said anything about the payment,
+			// and the node has no record of one: it never started.
+			if !received && o.neverSent(ctx, req.Invoice, err) {
+				return node.Payment{}, fmt.Errorf("sending: %w: %w",
+					node.ErrNotSent, err)
 			}
 
 			// The stream broke or the deadline passed. The payment is not
@@ -114,6 +129,46 @@ func (o *Outgoing) Pay(ctx context.Context, req node.PayRequest) (node.Payment,
 			return pmt, nil
 		}
 	}
+}
+
+// neverSent reports whether a payment call that failed provably started
+// nothing, so that Pay may return node.ErrNotSent.
+//
+// Two things have to hold. The failure is a status lnd's handler sends before
+// any payment exists: it refuses a request it cannot use (an unreadable
+// invoice, a CLTV limit the final hop with its padding does not fit) with
+// codes.Unknown or codes.InvalidArgument, and one for a hash it is paying or
+// has paid with codes.AlreadyExists. Unavailable, Canceled, DeadlineExceeded
+// and Internal are excluded: they are what a connection lost or a wait given
+// up on looks like, after the request may have arrived. And the node, asked
+// afterwards, has no record of a payment for the hash. A status alone is not
+// enough, since one could follow a payment that did start; the lookup is not
+// enough alone either, since after a connection lost mid-call the handler may
+// still be running and record the payment a moment later. Together they say
+// the request was turned away.
+//
+// Anything short of both is left as in flight, which is what Pay reports for
+// a failure it cannot read, and the driver asks the node again.
+func (o *Outgoing) neverSent(ctx context.Context, invoice string,
+	err error) bool {
+
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	switch st.Code() {
+	case codes.Unknown, codes.InvalidArgument, codes.AlreadyExists:
+	default:
+		return false
+	}
+
+	dec, err := o.Decode(ctx, invoice)
+	if err != nil {
+		return false
+	}
+	pmt, err := o.LookupPayment(ctx, dec.Hash)
+
+	return err == nil && pmt.State == node.PaymentNone
 }
 
 // LookupPayment reports what a payment is doing, without waiting for it.
