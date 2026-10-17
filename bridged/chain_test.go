@@ -21,6 +21,11 @@ type fakeChain struct {
 	spacing   time.Duration
 	now       time.Time
 	noHeaders bool
+
+	// headerSkew moves the time Header reads, and not the tip's: a header
+	// misread. ahead is a height whose block claims a time three hours on.
+	headerSkew time.Duration
+	ahead      int32
 }
 
 func (f *fakeChain) at(h int32) lnd.Header {
@@ -28,11 +33,12 @@ func (f *fakeChain) at(h int32) lnd.Header {
 	// and the mantissa halves, from 0x7fffff down.
 	bits := uint32(0x1d000000) | (0x7fffff >> uint(h/2016%16))
 
-	return lnd.Header{
-		Height: h,
-		Time:   f.now.Add(-time.Duration(f.tip-h) * f.spacing),
-		Bits:   bits,
+	at := f.now.Add(-time.Duration(f.tip-h) * f.spacing)
+	if h == f.ahead && h != 0 {
+		at = f.now.Add(3 * time.Hour)
 	}
+
+	return lnd.Header{Height: h, Time: at, Bits: bits}
 }
 
 func (f *fakeChain) Tip(context.Context) (lnd.Tip, error) {
@@ -45,7 +51,10 @@ func (f *fakeChain) Header(_ context.Context, h int32) (lnd.Header, error) {
 			"unknown service chainrpc.ChainKit")
 	}
 
-	return f.at(h), nil
+	hdr := f.at(h)
+	hdr.Time = hdr.Time.Add(f.headerSkew)
+
+	return hdr, nil
 }
 
 // chained is a service whose two observers are fed from fake chains.
@@ -134,5 +143,50 @@ func TestANodeWithoutHeadersLearnsFromTips(t *testing.T) {
 	}
 	if !s.chains()[0].noHeaders {
 		t.Error("the missing headers were not noticed")
+	}
+}
+
+// TestAHeaderTheNodeDisagreesWithIsNotSampled: the node's best header time and
+// the tip's header, read through ChainKit, are the same block's time decoded
+// twice. When they differ one of them is misread, and the tip is not sampled.
+func TestAHeaderTheNodeDisagreesWithIsNotSampled(t *testing.T) {
+	now := time.Now()
+	lf := &fakeChain{tip: 5*2016 + 200, spacing: 5 * time.Minute, now: now,
+		headerSkew: 600 * time.Second}
+	s := chained(t, lf, lf)
+
+	s.sampleChain(context.Background(), s.chains()[0])
+	if n := s.lfChain.Len(); n != 0 {
+		t.Errorf("%d blocks observed from a tip whose header disagrees", n)
+	}
+
+	lf.headerSkew = 0
+	s.sampleChain(context.Background(), s.chains()[0])
+	if n := s.lfChain.Len(); n != 1 {
+		t.Errorf("%d blocks observed once the two agree, want 1", n)
+	}
+}
+
+// TestABlockFromTheFutureIsNotSampled: a block time more than two hours ahead
+// is past what either chain accepts, so it is misread or made up, and at the
+// tip it would make the chain look stalled. It is dropped, from the backfill
+// and from the tip alike.
+func TestABlockFromTheFutureIsNotSampled(t *testing.T) {
+	now := time.Now()
+	lf := &fakeChain{tip: 5*2016 + 200, spacing: 5 * time.Minute, now: now,
+		ahead: 5*2016 + 150}
+	s := chained(t, lf, lf)
+
+	s.backfill(context.Background())
+	if n := s.lfChain.Len(); n != backfillBlocks-1 {
+		t.Errorf("%d blocks backfilled, want %d without the one ahead", n,
+			backfillBlocks-1)
+	}
+
+	lf.tip++
+	lf.ahead = lf.tip
+	s.sampleChain(context.Background(), s.chains()[0])
+	if n := s.lfChain.Len(); n != backfillBlocks-1 {
+		t.Errorf("a tip three hours ahead was sampled: %d blocks", n)
 	}
 }

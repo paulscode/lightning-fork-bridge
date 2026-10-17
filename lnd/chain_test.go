@@ -3,6 +3,8 @@ package lnd
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"math"
 	"net"
 	"testing"
@@ -199,5 +201,74 @@ func TestTheTipIsTheHeadersTime(t *testing.T) {
 		!tip.Synced {
 
 		t.Errorf("tip %+v", tip)
+	}
+}
+
+// btcd-blake2b's v2 header vectors profile_0_time_offset and
+// profile_0_time_offset_disabled_selector_255, serialized.
+const (
+	v2OffsetInUse = "" +
+		"000000a01f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504" +
+		"0302010000112233445566778899aabbccddeeff00102030405060708090a0b0" +
+		"c0d0e0f0a8913577ffff001d0df0ad0b44332211efcdab89ffeeddccbbaa9988" +
+		"77665544332211005802000003001c0000000000000000000000000000000000" +
+		"40d10c008967452301efcdab8967452301efcdab8967452301efcdab89674523" +
+		"01efcdab"
+
+	v2OffsetNotInUse = "" +
+		"000000a01f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504" +
+		"0302010000112233445566778899aabbccddeeff00102030405060708090a0b0" +
+		"c0d0e0f000943577ffff001dffffffff44332211efcdab89ffeeddccbbaa9988" +
+		"776655443322110088776655030018ff22222222222222221111111111111111" +
+		"40d10c0000000000000000000000000000000000000000000000000000000000" +
+		"00000000"
+)
+
+// TestAV2HeaderAddsItsTimeOffset: a BLAKE2b chain v2 header with the time
+// offset flag carries its block time less the offset, and the block time is
+// the two added. The headers are btcd-blake2b's wire test vectors
+// profile_0_time_offset (flags 0x1c, offset 600) and
+// profile_0_time_offset_disabled_selector_255 (flags 0x18, the offset not in
+// use), both mined at 2000000000.
+func TestAV2HeaderAddsItsTimeOffset(t *testing.T) {
+	vectors := map[string]string{
+		"offset in use":     v2OffsetInUse,
+		"offset not in use": v2OffsetNotInUse,
+	}
+	ck := &fakeChainKit{headers: map[int64][]byte{}}
+	var height int64
+	names := map[int64]string{}
+	for name, h := range vectors {
+		raw, err := hex.DecodeString(h)
+		if err != nil || len(raw) != 164 {
+			t.Fatalf("%s: %d bytes, %v", name, len(raw), err)
+		}
+		ck.headers[height], names[height] = raw, name
+		height++
+	}
+	c := NewChain(serveChain(t, &fakeNode{info: synced}, ck))
+
+	for h, name := range names {
+		got, err := c.Header(context.Background(), int32(h))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got.Time.Unix() != 2000000000 || got.Bits != 0x1d00ffff {
+			t.Errorf("%s: read %d and %#x, want 2000000000 and 0x1d00ffff",
+				name, got.Time.Unix(), got.Bits)
+		}
+	}
+
+	// The offset adds as a uint32, wrapping, as the chain's nodes add it.
+	raw, _ := hex.DecodeString(vectors["offset in use"])
+	binary.LittleEndian.PutUint32(raw[68:72], 0xfffffff0)
+	binary.LittleEndian.PutUint32(raw[104:108], 0x20)
+	if at, err := headerTime(raw); err != nil || at.Unix() != 0x10 {
+		t.Errorf("wrapped to %v, %v; want 16", at.Unix(), err)
+	}
+
+	// A header marked v2 that is not v2's length is not read.
+	if _, err := headerTime(raw[:100]); !errors.Is(err, ErrHeader) {
+		t.Errorf("a short v2 header gave %v", err)
 	}
 }

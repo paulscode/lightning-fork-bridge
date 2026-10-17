@@ -123,8 +123,8 @@ func compactToBig(bits uint32) *big.Int {
 // them.
 //
 // Only the timestamp and the bits are decoded, from their fixed offsets, so
-// this reads the header of either chain: the BLAKE2b fork changed how a
-// header is hashed, not how it is laid out.
+// this reads the header of either chain. A BLAKE2b chain v2 header (see
+// headerTime) can carry its time less an offset, which is added back.
 func (c *Chain) Header(ctx context.Context, height int32) (Header, error) {
 	if height < 0 {
 		return Header{}, fmt.Errorf("%w: height %d", ErrHeader, height)
@@ -148,18 +148,55 @@ func (c *Chain) Header(ctx context.Context, height int32) (Header, error) {
 		return Header{}, fmt.Errorf("the header at height %d: %w", height,
 			err)
 	}
-	if len(raw) < 80 {
-		return Header{}, fmt.Errorf("%w: a %d byte header at height %d",
-			ErrHeader, len(raw), height)
+	at, err := headerTime(raw)
+	if err != nil {
+		return Header{}, fmt.Errorf("%w at height %d", err, height)
 	}
 
-	// Bytes 68 to 72 are the timestamp and 72 to 76 the compact target,
-	// both little endian.
 	return Header{
 		Height: height,
-		Time:   time.Unix(int64(binary.LittleEndian.Uint32(raw[68:72])), 0),
+		Time:   at,
 		Bits:   binary.LittleEndian.Uint32(raw[72:76]),
 	}, nil
+}
+
+// The parts of a serialized header this reads. A classic header is 80 bytes:
+// the version at 0, the time at 68 and the compact target at 72, all little
+// endian. The BLAKE2b chain's v2 header sets the version's top bit and runs to
+// 164 bytes; of what it adds, the time offset is at 104 and the flags byte at
+// 110 (btcd-blake2b's wire.BlockHeader).
+const (
+	headerLenV1      = 80
+	headerLenV2      = 164
+	headerV2Flag     = 0x80000000
+	headerOffsetAt   = 104
+	headerFlagsAt    = 110
+	headerTimeOffset = 4 // the flag saying the offset is in use
+)
+
+// headerTime is the time a serialized header says its block was mined. A v2
+// header with the time offset flag carries that time less the offset, and the
+// block time is the two added, wrapping as a uint32 as the chain's own nodes
+// add them.
+func headerTime(raw []byte) (time.Time, error) {
+	if len(raw) < headerLenV1 {
+		return time.Time{}, fmt.Errorf("%w: a %d byte header", ErrHeader,
+			len(raw))
+	}
+
+	at := binary.LittleEndian.Uint32(raw[68:72])
+	if binary.LittleEndian.Uint32(raw[0:4])&headerV2Flag != 0 {
+		if len(raw) < headerLenV2 {
+			return time.Time{}, fmt.Errorf("%w: a v2 header of %d "+
+				"bytes, not %d", ErrHeader, len(raw), headerLenV2)
+		}
+		if raw[headerFlagsAt]&headerTimeOffset != 0 {
+			at += binary.LittleEndian.Uint32(
+				raw[headerOffsetAt : headerOffsetAt+4])
+		}
+	}
+
+	return time.Unix(int64(at), 0), nil
 }
 
 // call makes a unary ChainKit call whose reply's field 1 is bytes, and returns

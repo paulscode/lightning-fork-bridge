@@ -124,10 +124,24 @@ func (s *Service) sampleChain(ctx context.Context, src *chainSource) {
 	hdr, err := src.reader.Header(ctx, tip.Height)
 	read := err == nil && hdr.Height == tip.Height && !hdr.Time.IsZero()
 	if read {
+		// The node's best header time and the header read here are the
+		// same block's, decoded twice. Disagreeing, one of the two is
+		// misread, and there is no telling which.
+		if !hdr.Time.Equal(tip.Time) {
+			s.log.Warn("the tip's header and the node disagree about "+
+				"when it was mined; not sampled", "chain", src.name,
+				"height", tip.Height, "header", hdr.Time,
+				"node", tip.Time)
+
+			return
+		}
 		b.Time = hdr.Time
 		b.Difficulty = hdr.Difficulty()
 	} else if err != nil {
 		s.noHeader(src, err)
+	}
+	if s.future(src, b) {
+		return
 	}
 
 	// Add rejects nothing it should not; a height it already holds is
@@ -157,6 +171,23 @@ func (s *Service) noHeader(src *chainSource, err error) {
 	}
 	s.log.Debug("could not read a block header", "chain", src.name,
 		"err", err)
+}
+
+// MaxFutureBlockTime is how far past now a block's time may be and still be
+// sampled: the chains' own rule. A later one is misread or made up, and one
+// such block at the tip would make the chain look stalled, and the blocks
+// before it fast.
+const MaxFutureBlockTime = 2 * time.Hour
+
+// future reports, and logs, a block whose time is too far ahead to sample.
+func (s *Service) future(src *chainSource, b chainrate.Block) bool {
+	if !b.Time.After(time.Now().Add(MaxFutureBlockTime)) {
+		return false
+	}
+	s.log.Warn("a block's time is too far in the future to use; not "+
+		"sampled", "chain", src.name, "height", b.Height, "time", b.Time)
+
+	return true
 }
 
 // backfillBlocks is how many recent blocks are read into each observer at
@@ -201,10 +232,11 @@ func (s *Service) backfill(ctx context.Context) {
 
 				break
 			}
-			if s.addBlock(src.obs, chainrate.Block{
+			b := chainrate.Block{
 				Height: hdr.Height, Time: hdr.Time,
 				Difficulty: hdr.Difficulty(),
-			}) == nil {
+			}
+			if !s.future(src, b) && s.addBlock(src.obs, b) == nil {
 				added++
 			}
 		}
