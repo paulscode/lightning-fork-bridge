@@ -302,13 +302,11 @@ func (s *Service) priceCheck(sd *side) runner.PriceCheck {
 			return false, err
 		}
 
-		price := r.OutgoingPerIncoming
-		if sd.invert {
-			if price <= 0 {
-				return false, fmt.Errorf("%w: cannot invert a rate of %g",
-					rate.ErrObservation, price)
-			}
-			price = 1 / price
+		// The middle reading worse for the bridge in this direction,
+		// as the quote priced from.
+		price, err := r.ForSide(sd.invert)
+		if err != nil {
+			return false, err
 		}
 		worth := float64(sw.IncomingMsat) * price
 		owed := float64(sw.OutgoingMsat) + float64(sw.MaxFeeMsat)
@@ -350,13 +348,15 @@ func (s *Service) pricer(sd *side, inv inventory.Policy,
 				err)
 		}
 
-		if sd.invert {
-			if r.OutgoingPerIncoming <= 0 {
-				return rate.Reading{}, fmt.Errorf("%w: cannot invert a "+
-					"rate of %g", quote.ErrRefused, r.OutgoingPerIncoming)
-			}
-			r.OutgoingPerIncoming = 1 / r.OutgoingPerIncoming
+		// Two sources that agree leave two middle readings, and this
+		// direction quotes from the one worse for the bridge: the lower
+		// rate as it is, or the higher one inverted.
+		price, err := r.ForSide(sd.invert)
+		if err != nil {
+			return rate.Reading{}, fmt.Errorf("%w: %w", quote.ErrRefused,
+				err)
 		}
+		r.OutgoingPerIncoming = price
 
 		held, err := position(ctx)
 		if err != nil {

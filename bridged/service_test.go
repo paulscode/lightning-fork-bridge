@@ -666,3 +666,66 @@ func TestAFundedSwapIsPaidOnlyAtAPriceThatCoversIt(t *testing.T) {
 		t.Error("the runner has no price check")
 	}
 }
+
+// TestEachDirectionPricesFromTheCautiousMiddleReading: two price sources that
+// agree leave two middle readings. The direction that uses the rate as it is
+// quotes and checks at the lower one, and the direction that inverts it at
+// the higher one, inverted: each the one worse for the bridge.
+func TestEachDirectionPricesFromTheCautiousMiddleReading(t *testing.T) {
+	t.Parallel()
+
+	const lower, upper = 0.0030, 0.0031
+	s := testService(t, &fakeOut{accepts: "lnbc"},
+		&fakeOut{accepts: "lnblake"}, nil)
+	s.cfg.Rate.MaxAge = 90 * time.Second
+	s.price = rate.Reading{
+		OutgoingPerIncoming: (lower + upper) / 2, Lower: lower,
+		Upper: upper, At: time.Now(), Sources: 2, Venues: 2,
+	}
+	s.priceErr = nil
+
+	inv := inventory.DefaultPolicy
+	inv.TargetOutgoingMsat = 1_000_000_000
+	inv.FloorOutgoingMsat = 100_000_000
+	forward, err := s.pricer(s.sides[0], inv, s.sides[0].balance)(
+		context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reverse, err := s.pricer(s.sides[1], inv, s.sides[1].balance)(
+		context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forward.OutgoingPerIncoming != lower {
+		t.Errorf("forward quoted %g, want the lower %g",
+			forward.OutgoingPerIncoming, lower)
+	}
+	if math.Abs(reverse.OutgoingPerIncoming-1/upper) > 1e-9 {
+		t.Errorf("reverse quoted %g, want 1/%g", reverse.OutgoingPerIncoming,
+			upper)
+	}
+
+	// The check before paying uses the same price: 1,000,000 msat in is
+	// worth 3,000 msat out at the lower reading, short of 3,040 owed, and
+	// would cover it at the midpoint.
+	sw := &driver.Swap{IncomingMsat: 1_000_000, OutgoingMsat: 2_940,
+		MaxFeeMsat: 100}
+	if ok, err := s.priceCheck(s.sides[0])(context.Background(), sw); err !=
+		nil || ok {
+
+		t.Errorf("paid at %v (%v); the lower reading does not cover it",
+			ok, err)
+	}
+	// Inverted: 1,000,000 msat in is worth 1e6/0.0031 at the higher
+	// reading, 322,580,645 msat, short of 327,000,000 owed, which the
+	// midpoint covers.
+	sw = &driver.Swap{IncomingMsat: 1_000_000,
+		OutgoingMsat: 327_000_000}
+	if ok, err := s.priceCheck(s.sides[1])(context.Background(), sw); err !=
+		nil || ok {
+
+		t.Errorf("paid at %v (%v); the higher reading inverted does not "+
+			"cover it", ok, err)
+	}
+}
