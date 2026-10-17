@@ -449,15 +449,18 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 	// What the bridge can actually pay, which is not what its balance says:
 	// every swap already quoted, offered or funded is a claim on the same
 	// money. Checked after the duplicate guard so that the amount about to be
-	// committed is not already counted in it.
+	// committed is not already counted in it. The routing budget counts
+	// too: the payment leaves with its fees, and a swap that fits only
+	// without them is one the node cannot route.
 	room, err := q.Room(ctx)
 	if err != nil {
 		return Quote{}, fmt.Errorf("%w: %w", ErrRefused, err)
 	}
-	if dec.AmountMsat > room {
-		return Quote{}, fmt.Errorf("%w: %w: %d msat against %d msat of "+
-			"headroom; the rest is promised to swaps that have not "+
-			"finished", ErrRefused, ErrNoLiquidity, dec.AmountMsat, room)
+	if need := dec.AmountMsat + q.feeBudget(dec.AmountMsat); need > room {
+		return Quote{}, fmt.Errorf("%w: %w: %d msat with its routing "+
+			"budget against %d msat of headroom; the rest is promised to "+
+			"swaps that have not finished", ErrRefused, ErrNoLiquidity,
+			need, room)
 	}
 
 	reading, err := q.Price(ctx)
@@ -748,10 +751,7 @@ func (q *Quoter) price(dec node.Decoded, r rate.Reading) (Quote, error) {
 			ErrRefused)
 	}
 
-	fee := uint64(math.Ceil(float64(dec.AmountMsat) * q.Policy.FeeFraction))
-	if fee < q.Policy.MinFeeMsat {
-		fee = q.Policy.MinFeeMsat
-	}
+	fee := q.feeBudget(dec.AmountMsat)
 	// The floor, unlike the fraction, can outgrow the spread on a small
 	// payout, and then every such swap loses money by construction.
 	if float64(fee) >= float64(dec.AmountMsat)*r.Spread {
@@ -769,6 +769,17 @@ func (q *Quoter) price(dec node.Decoded, r rate.Reading) (Quote, error) {
 		MaxFeeMsat:   fee,
 		Description:  dec.Description,
 	}, nil
+}
+
+// feeBudget is the routing budget for a payout: the policy's fraction of it,
+// and never less than its floor.
+func (q *Quoter) feeBudget(amountMsat uint64) uint64 {
+	fee := uint64(math.Ceil(float64(amountMsat) * q.Policy.FeeFraction))
+	if fee < q.Policy.MinFeeMsat {
+		fee = q.Policy.MinFeeMsat
+	}
+
+	return fee
 }
 
 // create records the swap, then builds the hold invoice, then records that it

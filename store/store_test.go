@@ -1199,3 +1199,40 @@ func TestAJournalHasOneWriter(t *testing.T) {
 		t.Errorf("the record did not survive: %v", err)
 	}
 }
+
+// TestCommittedCountsTheRoutingBudget: a payment leaves with its fees, so a
+// swap owes its payout and its routing budget, and headroom that covered only
+// the payouts would leave the last swap before the floor unroutable.
+func TestCommittedCountsTheRoutingBudget(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemory()
+
+	for n, st := range []swap.State{swap.Offered, swap.Paying, swap.Settled} {
+		r := rec(byte(n+1), st)
+		r.OutgoingMsat = 1_000
+		r.MaxFeeMsat = 30
+		if err := s.Put(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := Committed(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 2*1_030 {
+		t.Errorf("committed %d, want %d", got, 2*1_030)
+	}
+
+	// And a budget that overflows the sum is refused like a payout that
+	// does.
+	r := rec(9, swap.Funded)
+	r.OutgoingMsat = 10
+	r.MaxFeeMsat = ^uint64(0) - 5
+	if err := s.Put(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Committed(ctx, s); !errors.Is(err, ErrRecord) {
+		t.Errorf("want ErrRecord, got %v", err)
+	}
+}

@@ -1038,3 +1038,38 @@ func TestTheFinalHopIsCheckedWithThePayingNodesPadding(t *testing.T) {
 		})
 	}
 }
+
+// TestHeadroomCoversTheRoutingBudget: the payment leaves with its fees, so a
+// swap needs room for its payout and its routing budget. Room for the payout
+// alone is refused, and the budget is what the swap then records.
+func TestHeadroomCoversTheRoutingBudget(t *testing.T) {
+	ctx := context.Background()
+	d := decoded()
+	fee := uint64(math.Ceil(float64(d.AmountMsat) *
+		DefaultPolicy.FeeFraction))
+
+	for _, c := range []struct {
+		room uint64
+		ok   bool
+	}{
+		{d.AmountMsat, false},
+		{d.AmountMsat + fee - 1, false},
+		{d.AmountMsat + fee, true},
+	} {
+		in := &fakeIn{}
+		q, _ := build(t, in, &fakeOut{decoded: d}, 0.01)
+		q.Room = func(context.Context) (uint64, error) { return c.room, nil }
+
+		got, err := q.Quote(ctx, "lnbc1x")
+		switch {
+		case c.ok && err != nil:
+			t.Errorf("room %d: refused: %v", c.room, err)
+		case c.ok && got.MaxFeeMsat != fee:
+			t.Errorf("room %d: budget %d, want %d", c.room,
+				got.MaxFeeMsat, fee)
+		case !c.ok && CodeOf(err) != CodeNoLiquidity:
+			t.Errorf("room %d for %d msat and a %d msat budget: code %q "+
+				"(%v)", c.room, d.AmountMsat, fee, CodeOf(err), err)
+		}
+	}
+}

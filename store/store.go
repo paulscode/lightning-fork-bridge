@@ -241,7 +241,9 @@ type Store interface {
 }
 
 // Committed is the outgoing amount the bridge may still have to pay across
-// every swap that has not finished.
+// every swap that has not finished, routing fees included: each swap counts
+// its payout and its routing budget (MaxFeeMsat), since the payment leaves
+// with both and the balance has to cover both.
 //
 // It is what makes a balance into headroom. The node's outgoing balance says
 // what could be sent right now; it says nothing about the swaps already
@@ -280,14 +282,15 @@ func CommittedWhere(ctx context.Context, s Store,
 		}
 		switch r.State {
 		case swap.Quoted, swap.Offered, swap.Funded, swap.Paying:
-			// Saturating, because an overflow here would report a small
-			// commitment for an enormous one, in the direction that
-			// oversells.
-			if total+r.OutgoingMsat < total {
+			// Refusing rather than wrapping, because an overflow here
+			// would report a small commitment for an enormous one, in
+			// the direction that oversells.
+			owed := r.OutgoingMsat + r.MaxFeeMsat
+			if owed < r.OutgoingMsat || total+owed < total {
 				return 0, fmt.Errorf("%w: committed amounts overflow",
 					ErrRecord)
 			}
-			total += r.OutgoingMsat
+			total += owed
 		}
 	}
 
