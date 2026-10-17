@@ -36,6 +36,12 @@ var (
 
 	// ErrRecord is returned for a record that cannot be stored.
 	ErrRecord = errors.New("record is not usable")
+
+	// ErrLocked is returned when another Journal, in this process or
+	// another, already has the journal open. Two writers on one journal
+	// each replay it once and then append without seeing the other's
+	// records, and recovery would believe whichever wrote last.
+	ErrLocked = errors.New("the journal is open elsewhere")
 )
 
 // Record is one swap, in the form that survives a restart.

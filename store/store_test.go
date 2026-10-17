@@ -966,6 +966,9 @@ func TestTheNewFieldsSurviveTheJournal(t *testing.T) {
 
 		t.Errorf("round trip lost something: %+v", got)
 	}
+	if err := again.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// A record from before bindings: no binding field at all.
 	old := `{"hash":"` + strings.Repeat("aa", 32) + `","state":"funded",` +
@@ -1149,5 +1152,50 @@ func TestWhereFindsFinishedSwapsToo(t *testing.T) {
 	}
 	if len(lost) != 1 || lost[0].Hash != (node.Hash{1}) {
 		t.Errorf("found %v, wanted the one lost swap", lost)
+	}
+}
+
+// TestAJournalHasOneWriter: a second Open of a journal that is open is
+// refused, in this process as in another, and allowed once the first is
+// closed. Two writers would each replay the file once and append without
+// seeing the other's records. The lock is on a file beside the journal, so it
+// survives Compact renaming a new journal over the old one.
+func TestAJournalHasOneWriter(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "swaps.journal")
+
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); !errors.Is(err, ErrLocked) {
+		t.Fatalf("a second open while the first is open: want ErrLocked, "+
+			"got %v", err)
+	}
+
+	// Compaction installs a new file under the journal's name, and the
+	// journal stays locked.
+	if err := first.Put(ctx, rec(1, swap.Quoted)); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Compact(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); !errors.Is(err, ErrLocked) {
+		t.Fatalf("a second open after compacting: want ErrLocked, got %v",
+			err)
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("the journal could not be opened after the first closed: "+
+			"%v", err)
+	}
+	defer second.Close()
+	if _, err := second.Get(ctx, rec(1, swap.Quoted).Hash); err != nil {
+		t.Errorf("the record did not survive: %v", err)
 	}
 }

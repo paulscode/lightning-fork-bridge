@@ -162,6 +162,10 @@ type Journal struct {
 	file  *os.File
 	index map[node.Hash]Record
 
+	// lock holds the exclusive lock on path+".lock" for as long as the
+	// journal is open. Nil where the platform has no flock.
+	lock *os.File
+
 	// size is the length of the file up to the last record known good. A
 	// write that fails part way through is rolled back to it.
 	size int64
@@ -173,19 +177,44 @@ type Journal struct {
 	RepairedBytes int64
 }
 
+// LockSuffix names the file next to a journal that Open locks: the journal's
+// path with this appended.
+//
+// A separate file, because Compact installs a new journal by renaming over
+// the old one, and a lock on the journal's own descriptor would stay with the
+// replaced inode while a second process opened the new one unopposed.
+const LockSuffix = ".lock"
+
 // Open opens or creates a journal and replays it.
+//
+// It refuses with ErrLocked while another Journal has the same path open, in
+// this process or any other, until that one is closed. Two writers would each
+// replay the file once and then append without seeing the other's records.
 func Open(path string) (*Journal, error) {
+	lock, err := lockFile(path + LockSuffix)
+	if err != nil {
+		return nil, err
+	}
+
 	// O_APPEND so that every write lands at the end whatever the offset is.
 	// Replay seeks around to read, and an append-only descriptor means a
 	// missed seek can corrupt a record rather than merely misread one.
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
+		if lock != nil {
+			lock.Close()
+		}
+
 		return nil, fmt.Errorf("opening journal: %w", err)
 	}
 
-	j := &Journal{path: path, file: f, index: map[node.Hash]Record{}}
+	j := &Journal{path: path, file: f, index: map[node.Hash]Record{},
+		lock: lock}
 	if err := j.replay(); err != nil {
 		f.Close()
+		if lock != nil {
+			lock.Close()
+		}
 
 		return nil, err
 	}
@@ -505,10 +534,20 @@ func (j *Journal) Compact(ctx context.Context) error {
 	return nil
 }
 
-// Close closes the journal.
+// Close closes the journal and releases its lock.
 func (j *Journal) Close() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	return j.file.Close()
+	err := j.file.Close()
+	if j.lock != nil {
+		// After the journal itself, so that nothing else can open it
+		// while this one still might write.
+		if lerr := j.lock.Close(); err == nil {
+			err = lerr
+		}
+		j.lock = nil
+	}
+
+	return err
 }
