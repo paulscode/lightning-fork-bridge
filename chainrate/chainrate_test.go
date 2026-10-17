@@ -500,3 +500,49 @@ func TestTheSlowBoundTakesTheSlowerEstimate(t *testing.T) {
 		t.Errorf("slow bound %v would not have covered 2021", est.Bounds.Slow)
 	}
 }
+
+// TestAnEpochsDifficultyIsItsGreatest: the previous epoch is scaled by the
+// difficulty change, and each epoch's difficulty is the greatest its blocks
+// show. A test network mines a block at difficulty one when its chain is
+// slow, and a block read without its header has none; read as its epoch's,
+// either scales the previous epoch by orders of magnitude, a fast bound of
+// days or of microseconds, or none at all.
+func TestAnEpochsDifficultyIsItsGreatest(t *testing.T) {
+	p := BlakeParams
+	p.SurgeWindow = 0
+	base := time.Unix(1_700_000_000, 0)
+
+	for _, c := range []struct {
+		name    string
+		prevEnd float64 // the previous epoch's last block's difficulty
+		curFrom float64 // the current epoch's first block's
+	}{
+		{"the previous epoch ends at difficulty one", 1, 3e9},
+		{"the current epoch starts at difficulty one", 1e9, 1},
+		{"the current epoch's first difficulty is unknown", 1e9, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			o, err := New(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prev := steady(2016, 2016, base, 200*time.Second, 1e9)
+			prev[len(prev)-1].Difficulty = c.prevEnd
+			feed(t, o, prev)
+			cur := steady(4032, 10, last(prev), 5000*time.Second, 3e9)
+			cur[0].Difficulty = c.curFrom
+			feed(t, o, cur)
+
+			// 200 s at a third of the difficulty is 600 s, which is
+			// faster than the ten blocks so far, so it is the spacing.
+			est, err := o.Estimate(last(cur))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if est.Spacing != 600*time.Second || !est.FromPreviousEpoch {
+				t.Errorf("spacing %v from the previous epoch %v, want "+
+					"600s from it", est.Spacing, est.FromPreviousEpoch)
+			}
+		})
+	}
+}

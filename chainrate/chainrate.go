@@ -260,6 +260,19 @@ func meanSpacing(blocks []Block) (time.Duration, error) {
 	return span / time.Duration(steps), nil
 }
 
+// maxDifficulty is the greatest difficulty among blocks, zero when none is
+// known.
+func maxDifficulty(blocks []Block) float64 {
+	var d float64
+	for _, b := range blocks {
+		if b.Difficulty > d {
+			d = b.Difficulty
+		}
+	}
+
+	return d
+}
+
 // Estimate derives the bounds from what has been observed.
 //
 // It returns an error rather than a guess whenever the observations cannot
@@ -295,10 +308,13 @@ func (o *Observer) Estimate(now time.Time) (Estimate, error) {
 	var scaled time.Duration
 	var haveScaled bool
 	if prevMean, err := meanSpacing(previous); err == nil {
-		// current always holds at least the tip: the boundary is the tip's
-		// own epoch start, so the tip cannot sort below it.
-		prevDiff := previous[len(previous)-1].Difficulty
-		curDiff := current[0].Difficulty
+		// Each epoch's difficulty is the greatest any of its blocks
+		// shows, not one block's: a test network mines blocks at
+		// difficulty one when its chain is slow, and a block read without
+		// its header has none. Either, read as the epoch's, would scale
+		// the previous epoch by orders of magnitude.
+		prevDiff := maxDifficulty(previous)
+		curDiff := maxDifficulty(current)
 		if prevDiff > 0 && curDiff > 0 {
 			scaled = time.Duration(float64(prevMean) * curDiff / prevDiff)
 			haveScaled = scaled > 0
