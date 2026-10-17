@@ -65,6 +65,20 @@ type Observation struct {
 
 	// At is when the reading was taken, not when it was received.
 	At time.Time
+
+	// Venue is the market the reading comes from. Two readings from one
+	// venue are one venue's say, however many there are, and Reading.Venues
+	// counts each venue once. Empty means the reading's Source.
+	Venue string
+}
+
+// venue is the market an observation counts as.
+func (o Observation) venue() string {
+	if o.Venue != "" {
+		return o.Venue
+	}
+
+	return o.Source
 }
 
 // Valid reports whether an observation can be used.
@@ -142,6 +156,17 @@ type Reading struct {
 	// is worth knowing about, since the cross-check did not happen.
 	Sources int
 
+	// Venues is how many distinct venues those readings came from.
+	Venues int
+
+	// Lower and Upper are the two middle readings, the same reading when
+	// their number is odd. With an even number the median falls between
+	// two readings that both agreed, and each direction prices from the one
+	// that is worse for the bridge: Lower when OutgoingPerIncoming is used
+	// as it is, Upper when it is inverted. OutgoingPerIncoming is the
+	// midpoint of the two.
+	Lower, Upper float64
+
 	// Spread is the fraction to charge, widened by what the market has
 	// recently done.
 	Spread float64
@@ -185,21 +210,30 @@ func (o *Oracle) Trip(now time.Time, reason string) {
 	o.reason = reason
 }
 
+// combined is what combine concluded: the two middle readings, how many fresh
+// readings there were, and from how many venues.
+type combined struct {
+	lower, upper    float64
+	sources, venues int
+}
+
 // combine reduces observations to one price, refusing when those that should
 // agree do not.
-func combine(obs []Observation, p Policy, now time.Time) (float64, int, error) {
+func combine(obs []Observation, p Policy, now time.Time) (combined, error) {
 	var fresh []Observation
+	venues := map[string]bool{}
 	for _, o := range obs {
 		if !o.Valid() {
-			return 0, 0, fmt.Errorf("%w: %+v", ErrObservation, o)
+			return combined{}, fmt.Errorf("%w: %+v", ErrObservation, o)
 		}
 		if now.Sub(o.At) > p.MaxAge || o.At.After(now.Add(p.MaxAge)) {
 			continue
 		}
 		fresh = append(fresh, o)
+		venues[o.venue()] = true
 	}
 	if len(fresh) == 0 {
-		return 0, 0, fmt.Errorf("%w: %d observations, none within %v",
+		return combined{}, fmt.Errorf("%w: %d observations, none within %v",
 			ErrStale, len(obs), p.MaxAge)
 	}
 
@@ -211,7 +245,7 @@ func combine(obs []Observation, p Policy, now time.Time) (float64, int, error) {
 			gap := math.Abs(a.OutgoingPerIncoming-b.OutgoingPerIncoming) /
 				math.Min(a.OutgoingPerIncoming, b.OutgoingPerIncoming)
 			if gap > p.MaxDisagreement {
-				return 0, 0, fmt.Errorf("%w: %s says %g, %s says %g, "+
+				return combined{}, fmt.Errorf("%w: %s says %g, %s says %g, "+
 					"a gap of %.1f%% against a limit of %.1f%%",
 					ErrDisagreement, a.Source, a.OutgoingPerIncoming,
 					b.Source, b.OutgoingPerIncoming, gap*100,
@@ -221,14 +255,21 @@ func combine(obs []Observation, p Policy, now time.Time) (float64, int, error) {
 	}
 
 	// They agree, so the median is as good as any and is robust to a third
-	// source drifting.
+	// source drifting. With an even number there are two middle readings,
+	// and which one is cautious depends on the direction (see Reading), so
+	// both are kept.
 	prices := make([]float64, len(fresh))
 	for i, o := range fresh {
 		prices[i] = o.OutgoingPerIncoming
 	}
 	sort.Float64s(prices)
 
-	return prices[len(prices)/2], len(fresh), nil
+	return combined{
+		lower:   prices[(len(prices)-1)/2],
+		upper:   prices[len(prices)/2],
+		sources: len(fresh),
+		venues:  len(venues),
+	}, nil
 }
 
 // volatility is the largest relative move inside the breaker window.
@@ -255,10 +296,11 @@ func (o *Oracle) Update(now time.Time, obs []Observation) (Reading, error) {
 			o.broken.Format(time.RFC3339), why)
 	}
 
-	price, sources, err := combine(obs, o.policy, now)
+	c, err := combine(obs, o.policy, now)
 	if err != nil {
 		return Reading{}, err
 	}
+	price := (c.lower + c.upper) / 2
 
 	vol := o.volatility(price, now, o.policy)
 	if vol > o.policy.BreakerMove {
@@ -276,7 +318,10 @@ func (o *Oracle) Update(now time.Time, obs []Observation) (Reading, error) {
 	r := Reading{
 		OutgoingPerIncoming: price,
 		At:                  now,
-		Sources:             sources,
+		Sources:             c.sources,
+		Venues:              c.venues,
+		Lower:               c.lower,
+		Upper:               c.upper,
 		Spread:              spread,
 		Volatility:          vol,
 	}
@@ -295,6 +340,28 @@ func (o *Oracle) Update(now time.Time, obs []Observation) (Reading, error) {
 	}
 
 	return r, nil
+}
+
+// ForSide is the price a direction quotes from: the lower middle reading
+// as it is, or the reciprocal of the upper one for a direction that inverts
+// the rate. Either is the middle reading worse for the bridge. A reading
+// without its middle readings, one built by hand, gives OutgoingPerIncoming.
+func (r Reading) ForSide(invert bool) (float64, error) {
+	price := r.OutgoingPerIncoming
+	switch {
+	case invert && r.Upper > 0:
+		price = r.Upper
+	case !invert && r.Lower > 0:
+		price = r.Lower
+	}
+	if !(price > 0) || math.IsInf(price, 0) {
+		return 0, fmt.Errorf("%w: a rate of %g", ErrObservation, price)
+	}
+	if invert {
+		return 1 / price, nil
+	}
+
+	return price, nil
 }
 
 // Derive turns a dollar pair and a BTC price into the cross-check reading.

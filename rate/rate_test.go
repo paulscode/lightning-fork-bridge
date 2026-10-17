@@ -371,3 +371,91 @@ func TestZeroCooldownIsRefused(t *testing.T) {
 		t.Errorf("want ErrBroken, got %v", err)
 	}
 }
+
+// TestTwoReadingsPriceEachSideFromTheCautiousOne: with an even number of
+// readings the median falls between two that both agreed, and either could be
+// quoted. Each direction takes the one worse for the bridge: the lower one
+// where the rate is used as it is, and the higher one, inverted, where it is
+// inverted. Taking the higher for both gave the inverting direction its
+// cautious price and the other direction the generous one.
+func TestTwoReadingsPriceEachSideFromTheCautiousOne(t *testing.T) {
+	o, _ := New(DefaultPolicy)
+	r, err := o.Update(now, []Observation{
+		obs("a", 0.0100, now), obs("b", 0.0102, now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Lower != 0.0100 || r.Upper != 0.0102 {
+		t.Errorf("middle readings %g and %g, want 0.0100 and 0.0102",
+			r.Lower, r.Upper)
+	}
+	if got, _ := r.ForSide(false); got != 0.0100 {
+		t.Errorf("the direction using the rate as it is gets %g, want "+
+			"the lower 0.0100", got)
+	}
+	if got, _ := r.ForSide(true); math.Abs(got-1/0.0102) > 1e-9 {
+		t.Errorf("the inverting direction gets %g, want 1/0.0102", got)
+	}
+
+	// With an odd number the median is one reading, for both.
+	r, err = o.Update(now, []Observation{
+		obs("a", 0.0100, now), obs("b", 0.0102, now), obs("c", 0.0101, now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Lower != 0.0101 || r.Upper != 0.0101 ||
+		r.OutgoingPerIncoming != 0.0101 {
+
+		t.Errorf("three readings gave %g..%g, %g; want 0.0101", r.Lower,
+			r.Upper, r.OutgoingPerIncoming)
+	}
+
+	// A reading built by hand, without middle readings, prices from its
+	// rate, and one that cannot be inverted is refused.
+	if got, _ := (Reading{OutgoingPerIncoming: 0.5}).ForSide(true); got != 2 {
+		t.Errorf("a hand-built reading inverted to %g, want 2", got)
+	}
+	if _, err := (Reading{}).ForSide(true); !errors.Is(err,
+		ErrObservation) {
+
+		t.Errorf("a zero rate inverted with %v", err)
+	}
+}
+
+// TestReadingsCountVenuesOnce: two readings from one market are that
+// market's say twice, not two markets agreeing, so Venues counts it once. A
+// reading naming no venue is its own.
+func TestReadingsCountVenuesOnce(t *testing.T) {
+	o, _ := New(DefaultPolicy)
+	a, b := obs("ticker", 0.0100, now), obs("book", 0.0100, now)
+	a.Venue, b.Venue = "neoxa.exchange", "neoxa.exchange"
+
+	r, err := o.Update(now, []Observation{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Sources != 2 || r.Venues != 1 {
+		t.Errorf("%d sources from %d venues, want 2 from 1", r.Sources,
+			r.Venues)
+	}
+
+	r, err = o.Update(now, []Observation{a, b, obs("other", 0.0100, now)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Venues != 2 {
+		t.Errorf("%d venues, want 2", r.Venues)
+	}
+
+	// A stale reading's venue does not count.
+	r, err = o.Update(now, []Observation{a,
+		obs("other", 0.0100, now.Add(-time.Hour))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Venues != 1 {
+		t.Errorf("%d venues counting a stale one, want 1", r.Venues)
+	}
+}
