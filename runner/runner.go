@@ -42,7 +42,15 @@ var (
 // DefaultFundedGrace is how long a funded swap may wait to be paid past its
 // quote's expiry. Long enough to ride out a node restart, short enough that
 // the price it pays at is still recent.
+//
+// It is not bounded by the outgoing invoice's life, which may be a minute: the
+// gate refuses a swap whose invoice has less than its GateReserve left,
+// whatever the grace, so a short invoice ends its swap's wait at its own
+// expiry and a long one may use the whole grace.
 const DefaultFundedGrace = 10 * time.Minute
+
+// DefaultGateReserve is GateReserve when none is set.
+const DefaultGateReserve = 5 * time.Second
 
 // DefaultPoll is how often the nodes are asked what changed.
 //
@@ -81,8 +89,19 @@ type Runner struct {
 	// would otherwise pay out at a loss whenever the move went against it.
 	PriceCheck PriceCheck
 
-	// PayTimeout bounds one outgoing attempt. Zero means two minutes.
+	// PayTimeout bounds one outgoing attempt. Zero means two minutes. An
+	// attempt on an invoice with less life left than this is bounded by
+	// that instead, plus ExpirySlack (see payTimeoutFor).
 	PayTimeout time.Duration
+
+	// GateReserve is the least time the outgoing invoice must have left
+	// for the gate to pay it. Zero means DefaultGateReserve.
+	//
+	// It is small because a payout that arrives too late costs nothing
+	// but the payer's wait: the invoice's expiry fails it, and the payer's
+	// funds come back. It is there so a payment is not started that cannot
+	// cross the network before the invoice lapses.
+	GateReserve time.Duration
 
 	// RouteTimeout bounds asking the paying node for a route at the gate.
 	// Zero means DefaultRouteTimeout.
@@ -161,6 +180,32 @@ func (r *Runner) payTimeout() time.Duration {
 	}
 
 	return 2 * time.Minute
+}
+
+func (r *Runner) gateReserve() time.Duration {
+	if r.GateReserve > 0 {
+		return r.GateReserve
+	}
+
+	return DefaultGateReserve
+}
+
+// payTimeoutFor is the timeout for an attempt to pay an invoice that expires
+// at expiry: PayTimeout, or the invoice's remaining life plus ExpirySlack when
+// that is shorter, so that a payout that cannot arrive in time fails within
+// seconds of the invoice expiring and the payer's funds come back, rather
+// than after a whole PayTimeout. Never under a second, the least lnd takes:
+// it counts the timeout in whole seconds and reads none as its own default.
+func (r *Runner) payTimeoutFor(expiry time.Time) time.Duration {
+	timeout := r.payTimeout()
+	if left := expiry.Sub(r.now()) + ExpirySlack; left < timeout {
+		timeout = left
+	}
+	if timeout < time.Second {
+		timeout = time.Second
+	}
+
+	return timeout
 }
 
 func (r *Runner) log() *slog.Logger {
@@ -478,6 +523,37 @@ func fatal(err error) bool {
 func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 	log *slog.Logger) (bool, error) {
 
+	// First, whatever else can be read: an outgoing invoice with less than
+	// GateReserve left cannot be paid in time, and nothing else the gate
+	// asks changes that, so the payer's funds go back at once rather than
+	// at the end of the funded grace while a chain cannot be measured.
+	//
+	// It is not asked to outlive a whole attempt. A payment still out when
+	// the invoice lapses is waited on in Paying like any other: it reached
+	// the destination in time and settles, or the destination refuses it
+	// as late and it fails, and the payer's funds come back. The attempt's
+	// timeout is cut to the invoice's life (payTimeoutFor), so a payout
+	// that cannot arrive stops trying routes within seconds of the expiry.
+	expiry, err := r.payable(ctx, sw)
+	switch {
+	case err != nil:
+		// Waiting, as for the price: a node that could not read the
+		// invoice says nothing about it, and the funded grace gives the
+		// swap back if it never can. At the not-sent pace: a node that
+		// cannot decode is usually one restarting.
+		return false, fmt.Errorf("%w: reading the outgoing invoice: %w",
+			errNotReady, err)
+
+	case expiry.IsZero():
+		log.Info("gated", "decision", "outgoing invoice expires too soon")
+		action, err := r.apply(ctx, sw, swap.MarginRefused, log)
+		if err != nil {
+			return false, err
+		}
+
+		return true, r.carryOut(ctx, sw, action, log)
+	}
+
 	rates, err := r.Rates(ctx)
 	if err != nil {
 		// No usable measurement is a reason to wait, not to pay and not to
@@ -505,32 +581,10 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 		}
 	}
 
-	// The last checks before the margin: the paying node has a route now,
-	// and the outgoing invoice stays payable. Both are asked before Gate so
-	// that the margin decision is the last thing between the gate and
-	// recording Paying, however long these take.
+	// The last checks before the margin: the paying node has a route now.
+	// Asked before Gate so that the margin decision is the last thing
+	// between the gate and recording Paying, however long this takes.
 	//
-	// The outgoing invoice has to stay payable for the whole attempt. One
-	// that lapses while the payment is out is refused by the paying node,
-	// and the swap would wait in Paying on an answer that is not a
-	// payment; refusing now gives the payer's funds back instead.
-	if ok, err := r.payable(ctx, sw); err != nil {
-		// Waiting, as for the price: a node that could not read the
-		// invoice says nothing about it, and the funded grace gives the
-		// swap back if it never can. At the not-sent pace: a node that
-		// cannot decode is usually one restarting.
-		return false, fmt.Errorf("%w: reading the outgoing invoice: %w",
-			errNotReady, err)
-	} else if !ok {
-		log.Info("gated", "decision", "outgoing invoice expires too soon")
-		action, err := r.apply(ctx, sw, swap.MarginRefused, log)
-		if err != nil {
-			return false, err
-		}
-
-		return true, r.carryOut(ctx, sw, action, log)
-	}
-
 	// A node that has just restarted answers RPCs before its channels are
 	// up, and a payment sent then fails at once for want of a route, which
 	// gives the payer's funds back for a swap that a few seconds later
@@ -556,7 +610,7 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 		return true, r.carryOut(ctx, sw, action, log)
 	}
 
-	if err := r.pay(ctx, sw, log); err != nil {
+	if err := r.pay(ctx, sw, r.payTimeoutFor(expiry), log); err != nil {
 		// The record already says paying, which is the whole point: the
 		// swap is safe where it is and the next pass asks the node what
 		// became of the attempt.
@@ -566,29 +620,32 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 	return true, nil
 }
 
-// ExpirySlack is how long past the end of a payment attempt the outgoing
-// invoice must still be payable for the attempt to start: the attempt's own
-// timeout bounds it, and this covers the clocks of the bridge, the paying node
-// and the invoice's issuer disagreeing by a little.
-const ExpirySlack = time.Minute
+// ExpirySlack is how long past the outgoing invoice's expiry a payment attempt
+// may still run (payTimeoutFor): it covers the clocks of the bridge, the
+// paying node and the invoice's issuer disagreeing by a little, so a payout
+// the destination would still take is not given up on early.
+const ExpirySlack = 5 * time.Second
 
-// payable reports whether the outgoing invoice stays payable for a whole
-// attempt plus ExpirySlack, read by the node that will pay it. An invoice with
-// no readable expiry is not: the quote refused those, so one here means
-// something changed, and paying against it would be the permissive reading.
-func (r *Runner) payable(ctx context.Context, sw *driver.Swap) (bool, error) {
+// payable reports when the outgoing invoice expires, read by the node that
+// will pay it, or the zero time when it has less than GateReserve left and is
+// not to be paid. An invoice with no readable expiry is not to be paid
+// either: the quote refused those, so one here means something changed, and
+// paying against it would be the permissive reading.
+func (r *Runner) payable(ctx context.Context, sw *driver.Swap) (time.Time,
+	error) {
+
 	if r.Driver.Out == nil {
-		return false, fmt.Errorf("%w: no outgoing node", ErrConfig)
+		return time.Time{}, fmt.Errorf("%w: no outgoing node", ErrConfig)
 	}
 	dec, err := r.Driver.Out.Decode(ctx, sw.Invoice)
 	if err != nil {
-		return false, err
+		return time.Time{}, err
 	}
-	if dec.Expiry.IsZero() {
-		return false, nil
+	if dec.Expiry.IsZero() || dec.Expiry.Sub(r.now()) < r.gateReserve() {
+		return time.Time{}, nil
 	}
 
-	return dec.Expiry.Sub(r.now()) >= r.payTimeout()+ExpirySlack, nil
+	return dec.Expiry, nil
 }
 
 // DefaultRouteTimeout bounds asking the paying node for a route at the gate.
@@ -643,15 +700,16 @@ var errNotReady = errors.New("the paying node is not ready to pay")
 // pay sends the outgoing leg. By the time it is called the record already says
 // the swap is paying, which is what makes a crash here recoverable.
 func (r *Runner) pay(ctx context.Context, sw *driver.Swap,
-	log *slog.Logger) error {
+	timeout time.Duration, log *slog.Logger) error {
 
-	log.Info("paying", "msat", sw.OutgoingMsat, "cltv", sw.OutgoingCLTVLimit)
+	log.Info("paying", "msat", sw.OutgoingMsat, "cltv", sw.OutgoingCLTVLimit,
+		"timeout", timeout)
 
 	event, has, err := r.Driver.Pay(ctx, sw, node.PayRequest{
 		Invoice:    sw.Invoice,
 		MaxFeeMsat: sw.MaxFeeMsat,
 		CLTVLimit:  sw.OutgoingCLTVLimit,
-		Timeout:    r.payTimeout(),
+		Timeout:    timeout,
 	})
 	if err != nil {
 		// The attempt could not be made, or could not be concluded. Either

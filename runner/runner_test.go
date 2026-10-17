@@ -14,6 +14,7 @@ import (
 	"github.com/paulscode/lightning-fork-bridge/driver"
 	"github.com/paulscode/lightning-fork-bridge/margin"
 	"github.com/paulscode/lightning-fork-bridge/node"
+	"github.com/paulscode/lightning-fork-bridge/quote"
 	"github.com/paulscode/lightning-fork-bridge/store"
 	"github.com/paulscode/lightning-fork-bridge/swap"
 )
@@ -142,12 +143,18 @@ type fakeOut struct {
 
 	// lookupErr, when set, is what LookupPayment returns.
 	lookupErr error
+
+	// asked is the last payment asked for.
+	asked node.PayRequest
 }
 
-func (f *fakeOut) Pay(ctx context.Context, _ node.PayRequest) (node.Payment,
+func (f *fakeOut) Pay(ctx context.Context, req node.PayRequest) (node.Payment,
 	error) {
 
 	atomic.AddInt32(&f.paid, 1)
+	f.mu.Lock()
+	f.asked = req
+	f.mu.Unlock()
 	if f.delay > 0 {
 		select {
 		case <-ctx.Done():
@@ -452,6 +459,67 @@ func TestTheGraceIsConfigurable(t *testing.T) {
 	if final.State != swap.Aborted {
 		t.Fatalf("ended in %v, want aborted under a one-minute grace",
 			final.State)
+	}
+}
+
+// TestTheGraceEndsWithAShortInvoice: the funded grace is not a promise to
+// wait. A swap inside it is paid while its outgoing invoice has GateReserve
+// left (TestAFundedSwapIsPaidWithinItsGrace, on an invoice a day long), and
+// given back at once, unpaid, once it has not, whatever else the gate cannot
+// read: a short-lived invoice ends its swap's wait at its own expiry.
+func TestTheGraceEndsWithAShortInvoice(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		rates Rates
+	}{
+		{"chains measured", rates},
+		{"a chain unmeasured", func(context.Context) (driver.Rates, error) {
+			return driver.Rates{}, errors.New("cannot measure")
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := deadline(t)
+			defer cancel()
+
+			in := &fakeIn{
+				invoice: node.Invoice{State: node.InvoiceAccepted,
+					ExpiryHeight: 1000},
+				height: 500,
+			}
+			out := &fakeOut{payment: node.Payment{
+				State: node.PaymentSucceeded, Preimage: preimage,
+			}, expiry: now.Add(-10 * time.Second)}
+			rec := record(swap.Funded)
+			rec.QuoteExpiry = now.Add(-time.Minute)
+			r, st := build(t, in, out, rec)
+			r.Rates = c.rates
+
+			if err := r.Drive(ctx, hash); err != nil {
+				t.Fatal(err)
+			}
+
+			final, _ := st.Get(context.Background(), hash)
+			if final.State != swap.Aborted {
+				t.Fatalf("ended in %v, want aborted", final.State)
+			}
+			if n := atomic.LoadInt32(&out.paid); n != 0 {
+				t.Errorf("paid %d times on an expired invoice", n)
+			}
+			if _, cancelled := in.counts(); cancelled != 1 {
+				t.Errorf("cancelled %d times, want once", cancelled)
+			}
+		})
+	}
+}
+
+// TestTheQuoteReserveCoversTheGateReserve: a payer who funds a quote at its
+// last moment leaves the outgoing invoice QuoteReserve, and the gate pays it
+// only with GateReserve left, so the defaults must leave the first at least
+// the second, or such a swap is quoted, funded and then refunded.
+func TestTheQuoteReserveCoversTheGateReserve(t *testing.T) {
+	if quote.DefaultPolicy.QuoteReserve < DefaultGateReserve {
+		t.Errorf("quote reserve %v under the gate reserve %v",
+			quote.DefaultPolicy.QuoteReserve, DefaultGateReserve)
 	}
 }
 
@@ -1116,24 +1184,24 @@ func TestAPriceThatStillCoversThePayoutPays(t *testing.T) {
 	}
 }
 
-// TestAnOutgoingInvoiceExpiringDuringThePaymentIsNotPaid: an invoice that
-// lapses while the payment is out is refused by the paying node, and the swap
-// would wait in Paying for an answer that is not a payment. The gate gives the
-// payer's funds back instead when the invoice does not outlive a whole attempt
-// and ExpirySlack, and pays when it does.
-func TestAnOutgoingInvoiceExpiringDuringThePaymentIsNotPaid(t *testing.T) {
-	const timeout = 2 * time.Minute
-
+// TestTheGatePaysWhileTheInvoiceHasItsReserveLeft: the gate pays an outgoing
+// invoice with at least GateReserve left, however short, and gives the
+// payer's funds back for one with less, without paying. A payout still out
+// when the invoice lapses fails or settles like any other, so the invoice need
+// not outlive a whole attempt.
+func TestTheGatePaysWhileTheInvoiceHasItsReserveLeft(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		left time.Duration
 		want swap.State
 	}{
 		{"already expired", -time.Minute, swap.Aborted},
-		{"inside the attempt", timeout / 2, swap.Aborted},
-		{"inside the slack", timeout + ExpirySlack - time.Second,
+		{"4 s", 4 * time.Second, swap.Aborted},
+		{"just under the reserve", DefaultGateReserve - time.Millisecond,
 			swap.Aborted},
-		{"outlives both", timeout + ExpirySlack, swap.Settled},
+		{"the reserve", DefaultGateReserve, swap.Settled},
+		{"6 s", 6 * time.Second, swap.Settled},
+		{"an hour", time.Hour, swap.Settled},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			ctx, cancel := deadline(t)
@@ -1148,7 +1216,6 @@ func TestAnOutgoingInvoiceExpiringDuringThePaymentIsNotPaid(t *testing.T) {
 				State: node.PaymentSucceeded, Preimage: preimage,
 			}, expiry: now.Add(c.left)}
 			r, st := build(t, in, out, record(swap.Funded))
-			r.PayTimeout = timeout
 
 			if err := r.Drive(ctx, hash); err != nil {
 				t.Fatal(err)
@@ -1166,6 +1233,194 @@ func TestAnOutgoingInvoiceExpiringDuringThePaymentIsNotPaid(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTheGateReserveIsConfigurable.
+func TestTheGateReserveIsConfigurable(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}, expiry: now.Add(30 * time.Second)}
+	r, st := build(t, in, out, record(swap.Funded))
+	r.GateReserve = time.Minute
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Aborted {
+		t.Fatalf("ended in %v, want aborted under a one-minute reserve",
+			final.State)
+	}
+}
+
+// TestThePayoutTimeoutIsCutToTheInvoicesLife: an attempt on an invoice with
+// little life left is given that life plus ExpirySlack, not the whole
+// PayTimeout, so a payout that cannot arrive in time fails within seconds and
+// the payer's funds come back.
+func TestThePayoutTimeoutIsCutToTheInvoicesLife(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		left    time.Duration
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{"6 s left", 6 * time.Second, 2 * time.Minute,
+			6*time.Second + ExpirySlack},
+		{"45 s left", 45 * time.Second, 2 * time.Minute,
+			45*time.Second + ExpirySlack},
+		{"an hour left", time.Hour, 2 * time.Minute, 2 * time.Minute},
+		{"the default", time.Hour, 0, 2 * time.Minute},
+		{"a short timeout", 45 * time.Second, 10 * time.Second,
+			10 * time.Second},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := deadline(t)
+			defer cancel()
+
+			in := &fakeIn{
+				invoice: node.Invoice{State: node.InvoiceAccepted,
+					ExpiryHeight: 1000},
+				height: 500,
+			}
+			out := &fakeOut{payment: node.Payment{
+				State: node.PaymentSucceeded, Preimage: preimage,
+			}, expiry: now.Add(c.left)}
+			r, _ := build(t, in, out, record(swap.Funded))
+			r.PayTimeout = c.timeout
+
+			if err := r.Drive(ctx, hash); err != nil {
+				t.Fatal(err)
+			}
+
+			out.mu.Lock()
+			got := out.asked.Timeout
+			out.mu.Unlock()
+			if got != c.want {
+				t.Errorf("the attempt was given %v, want %v", got,
+					c.want)
+			}
+		})
+	}
+
+	// Never under the second lnd counts in, should the invoice lapse
+	// between the gate and the payment.
+	r := &Runner{Now: clock}
+	for _, c := range []struct{ left, want time.Duration }{
+		{-time.Minute, time.Second},
+		{-ExpirySlack, time.Second},
+		{-ExpirySlack + 300*time.Millisecond, time.Second},
+		{0, ExpirySlack},
+	} {
+		if got := r.payTimeoutFor(now.Add(c.left)); got != c.want {
+			t.Errorf("%v left: %v, want %v", c.left, got, c.want)
+		}
+	}
+}
+
+// TestAPayoutOutPastTheInvoicesExpiryIsWaitedOn: a payment still in flight
+// when the outgoing invoice lapses is waited on, not given up: the swap stays
+// in Paying, and the payer's HTLC is neither cancelled nor settled, until the
+// paying node says how it ended. A failure, which is what an invoice that
+// lapsed before the payment arrived produces, cancels the incoming (the
+// payer's refund) and never settles it; a success, one that arrived in time,
+// settles it.
+func TestAPayoutOutPastTheInvoicesExpiryIsWaitedOn(t *testing.T) {
+	for _, c := range []struct {
+		outcome node.Payment
+		want    swap.State
+	}{
+		{node.Payment{State: node.PaymentFailed}, swap.Failed},
+		{node.Payment{State: node.PaymentSucceeded, Preimage: preimage},
+			swap.Settled},
+	} {
+		t.Run(c.outcome.State.String(), func(t *testing.T) {
+			ctx, cancel := deadline(t)
+			defer cancel()
+
+			var clockNanos atomic.Int64
+			clockNanos.Store(now.UnixNano())
+			moving := func() time.Time {
+				return time.Unix(0, clockNanos.Load()).UTC()
+			}
+
+			in := &fakeIn{
+				invoice: node.Invoice{State: node.InvoiceAccepted,
+					ExpiryHeight: 1000},
+				height: 500,
+			}
+			out := &fakeOut{payment: node.Payment{
+				State: node.PaymentInFlight,
+			}, expiry: now.Add(6 * time.Second)}
+			r, st := build(t, in, out, record(swap.Funded))
+			r.Now, r.Driver.Now = moving, moving
+			r.Rates = func(context.Context) (driver.Rates, error) {
+				return driver.Rates{Incoming: blake, Outgoing: btc,
+					As: moving()}, nil
+			}
+
+			done := make(chan error, 1)
+			go func() { done <- r.Drive(ctx, hash) }()
+
+			waitFor(t, st, swap.Paying)
+
+			// The invoice lapses, the quote and the grace with it,
+			// while the payment is out.
+			clockNanos.Store(now.Add(time.Hour).UnixNano())
+			time.Sleep(50 * time.Millisecond)
+
+			cur, _ := st.Get(context.Background(), hash)
+			settled, cancelled := in.counts()
+			if cur.State != swap.Paying || settled != 0 || cancelled != 0 {
+				t.Fatalf("in %v, settled %d and cancelled %d while the "+
+					"payment was in flight", cur.State, settled,
+					cancelled)
+			}
+
+			out.mu.Lock()
+			out.lookup = c.outcome
+			out.mu.Unlock()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+
+			final, _ := st.Get(context.Background(), hash)
+			settled, cancelled = in.counts()
+			if final.State != c.want {
+				t.Fatalf("ended in %v, want %v", final.State, c.want)
+			}
+			if c.want == swap.Failed && (settled != 0 || cancelled != 1) {
+				t.Errorf("settled %d and cancelled %d, want the "+
+					"incoming cancelled once and never settled",
+					settled, cancelled)
+			}
+			if c.want == swap.Settled && (settled != 1 || cancelled != 0) {
+				t.Errorf("settled %d and cancelled %d, want one "+
+					"settle", settled, cancelled)
+			}
+		})
+	}
+}
+
+// waitFor waits for a swap's record to reach a state.
+func waitFor(t *testing.T, st store.Store, want swap.State) {
+	t.Helper()
+
+	for range 1000 {
+		rec, err := st.Get(context.Background(), hash)
+		if err == nil && rec.State == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("never reached %v", want)
 }
 
 // TestACancelAsksThePayingNodeFirst: before a failing or aborting swap gives
