@@ -990,3 +990,50 @@ func TestTheDestinationsMetadataReachesTheHoldInvoice(t *testing.T) {
 		t.Errorf("metadata out of nowhere: %+v", in2.asked)
 	}
 }
+
+// TestTheFinalHopIsCheckedWithThePayingNodesPadding: lnd's SendPaymentV2 adds
+// three blocks to the final hop's delta before checking the CLTV limit, and
+// QueryRoutes does not. An invoice inside those three blocks finds a route at
+// quote time and is refused by the node at payment, after the payer has
+// funded; it has to be refused here instead, against the policy's budget (a
+// fault of the invoice) and against what the chains allow now (retryable).
+func TestTheFinalHopIsCheckedWithThePayingNodesPadding(t *testing.T) {
+	ctx := context.Background()
+	allowed, _ := margin.MaxOutgoingBlocks(blake, btc, marg)
+
+	for _, c := range []struct {
+		name   string
+		limit  uint32
+		budget uint32
+		code   Code
+	}{
+		{"the policy's budget", 80, 80, CodeRouteBudget},
+		{"what the chains allow", allowed + 100, allowed,
+			CodeChainUnmeasured},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			for delta := c.budget - BlockPadding - 1; delta < c.budget; delta++ {
+				d := decoded()
+				d.CLTVDelta = delta
+				in := &fakeIn{}
+				q, _ := build(t, in, &fakeOut{decoded: d}, 0.015)
+				q.Policy.OutgoingCLTVLimit = c.limit
+
+				_, err := q.Quote(ctx, "lnbc1originalinvoice")
+				payable := delta+BlockPadding < c.budget
+				if payable && err != nil {
+					t.Errorf("a final hop of %d in %d blocks was "+
+						"refused: %v", delta, c.budget, err)
+				}
+				if !payable && CodeOf(err) != c.code {
+					t.Errorf("a final hop of %d in %d blocks: "+
+						"code %q, want %q (%v)", delta, c.budget,
+						CodeOf(err), c.code, err)
+				}
+				if !payable && in.asked != nil {
+					t.Error("a hold invoice was created")
+				}
+			}
+		})
+	}
+}

@@ -160,6 +160,14 @@ type Quote struct {
 	Description string
 }
 
+// BlockPadding is what lnd's SendPaymentV2 adds to the final hop's CLTV delta
+// before it checks a route against the payment's CLTV limit
+// (routing.BlockPadding): the limit has to exceed the delta by more than this.
+// QueryRoutes checks without it, so an invoice whose final hop leaves three
+// blocks or fewer under the limit finds a route at quote time and is then
+// refused by the node when it is paid.
+const BlockPadding = 3
+
 // RouteSlack is added to the CLTV of the route a paying node found, for the
 // swap's limit: a route that changes a little between the quote and the
 // payment still fits. Payment along a longer one fails, and the payer's funds
@@ -489,15 +497,16 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 		return Quote{}, fmt.Errorf("%w: %w: the chains allow no route "+
 			"budget now", ErrRefused, margin.ErrTooLong)
 	}
-	if budget <= dec.CLTVDelta {
+	if uint64(budget) <= uint64(dec.CLTVDelta)+BlockPadding {
 		// checkInvoice already refused an invoice whose final hop fills
 		// the policy's budget, so this is the chains' pace shrinking it:
 		// it passes, and is said as such rather than as a fault of the
 		// invoice.
 		return Quote{}, fmt.Errorf("%w: %w: the destination wants %d "+
-			"blocks on the final hop and the chains allow %d for the "+
-			"whole route now", ErrRefused, margin.ErrTooLong,
-			dec.CLTVDelta, budget)
+			"blocks on the final hop, %d with the paying node's "+
+			"padding, and the chains allow %d for the whole route now",
+			ErrRefused, margin.ErrTooLong, dec.CLTVDelta,
+			uint64(dec.CLTVDelta)+BlockPadding, budget)
 	}
 
 	// A route to the destination within the budgets, asked of the paying
@@ -683,12 +692,15 @@ func (q *Quoter) checkInvoice(dec node.Decoded, now time.Time) error {
 			"%v a quote needs", ErrRefused, ErrExpiresSoon,
 			dec.Expiry.Sub(now).Round(time.Second), q.Policy.MinRemainingLife)
 	}
-	if dec.CLTVDelta >= q.Policy.OutgoingCLTVLimit {
-		// The destination's own final-hop delta already fills the budget,
-		// leaving no blocks for the route in between.
+	padded := uint64(dec.CLTVDelta) + BlockPadding
+	if padded >= uint64(q.Policy.OutgoingCLTVLimit) {
+		// The destination's own final-hop delta, with the padding the
+		// paying node adds to it, already fills the budget, leaving no
+		// blocks for the route in between.
 		return fmt.Errorf("%w: %w: the destination wants %d blocks on the "+
-			"final hop and the whole route budget is %d", ErrRefused,
-			ErrRouteBudget, dec.CLTVDelta, q.Policy.OutgoingCLTVLimit)
+			"final hop, %d with the paying node's padding, and the whole "+
+			"route budget is %d", ErrRefused, ErrRouteBudget,
+			dec.CLTVDelta, padded, q.Policy.OutgoingCLTVLimit)
 	}
 
 	return nil
