@@ -307,10 +307,14 @@ func TestSwapLookup(t *testing.T) {
 			if got.State != "settled" {
 				t.Errorf("state %q", got.State)
 			}
-			// The preimage is the user's proof the destination was paid,
-			// so a settled swap that does not report one is useless to them.
-			if got.Preimage == "" {
-				t.Error("a settled swap should report its preimage")
+			// The preimage is not the asker's to have: anyone who can
+			// reach this can ask about any hash, and the payer's own
+			// node learns it by being settled.
+			if strings.Contains(w.Body.String(),
+				hex.EncodeToString(testPreimage[:])) ||
+				strings.Contains(w.Body.String(), "preimage") {
+
+				t.Errorf("the preimage was returned: %s", w.Body.String())
 			}
 		})
 	}

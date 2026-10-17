@@ -64,15 +64,16 @@ type QuoteResponse struct {
 }
 
 // SwapResponse is what the bridge believes about a swap.
+//
+// It carries no preimage. This answers anyone who can reach it about any hash,
+// and the preimage is the proof of payment for an invoice that may be someone
+// else's; the payer learns it from their own node when the hold invoice
+// settles.
 type SwapResponse struct {
 	Hash         string `json:"hash"`
 	State        string `json:"state"`
 	IncomingMsat uint64 `json:"incomingMsat"`
 	OutgoingMsat uint64 `json:"outgoingMsat"`
-
-	// Preimage is present once there is one, which is the user's proof the
-	// destination was paid.
-	Preimage string `json:"preimage,omitempty"`
 }
 
 // Handler is the daemon's HTTP surface.
@@ -216,14 +217,10 @@ func (s *Service) handleSwap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := SwapResponse{
+	writeJSON(w, http.StatusOK, SwapResponse{
 		Hash: hex.EncodeToString(rec.Hash[:]), State: rec.State.String(),
 		IncomingMsat: rec.IncomingMsat, OutgoingMsat: rec.OutgoingMsat,
-	}
-	if rec.Preimage != (node.Preimage{}) {
-		resp.Preimage = hex.EncodeToString(rec.Preimage[:])
-	}
-	writeJSON(w, http.StatusOK, resp)
+	})
 }
 
 // handleHealth answers whether the daemon could quote right now, which is a

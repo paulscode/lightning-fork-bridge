@@ -113,7 +113,7 @@ error found later costs whatever was in flight.
 | --- | --- |
 | `POST /quote` | takes an invoice on either chain, returns a hold invoice on the other |
 | | `expiresAt` is the deadline for paying it. Miss it and the hold invoice is cancelled; pay it and the CLTV, not the clock, is what bounds the swap |
-| `GET /swap/{hash}` | what the bridge believes about one swap, and the preimage once there is one |
+| `GET /swap/{hash}` | what the bridge believes about one swap; never the preimage, which the payer's own node learns when the hold invoice settles |
 | `GET /health` | whether it could quote right now, which is not the same as whether it is running |
 
 There is no authentication. A quote commits the bridge's money, so this belongs
