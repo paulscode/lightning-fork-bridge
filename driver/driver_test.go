@@ -756,3 +756,49 @@ func TestGateDoesNotCountTheHoldExpiryDelta(t *testing.T) {
 		t.Errorf("%d blocks above the delta should not pass", required-1)
 	}
 }
+
+// TestACancelledSwapWaitsForAPaymentStillInFlight: a swap giving back its
+// incoming HTLC whose outgoing payment is still in flight does not end as
+// failed or aborted because the incoming invoice is already cancelled. The
+// payment may yet succeed, which is a loss, not a refund: it waits, and ends
+// by what the payment does.
+func TestACancelledSwapWaitsForAPaymentStillInFlight(t *testing.T) {
+	ctx := context.Background()
+	in := &fakeIn{invoice: node.Invoice{State: node.InvoiceCancelled}}
+
+	for _, st := range []swap.State{swap.Failing, swap.Aborting} {
+		out := &fakeOut{lookup: node.Payment{State: node.PaymentInFlight}}
+		d := &Driver{In: in, Out: out, Policy: pol, Now: fixedNow}
+		sw := &Swap{Hash: swapHash, State: st}
+
+		if ev, ok, err := d.Resume(ctx, sw); ok || err != nil {
+			t.Errorf("%v, payment in flight: %v %v %v; want to wait", st,
+				ev, ok, err)
+		}
+
+		// It succeeds: the swap is paid, and the claim already gone.
+		out.lookup = node.Payment{State: node.PaymentSucceeded,
+			Preimage: knownPreimage}
+		if ev, ok, err := d.Resume(ctx, sw); !ok || err != nil ||
+			ev != swap.OutgoingSucceeded {
+
+			t.Errorf("%v, then succeeded: %v %v %v", st, ev, ok, err)
+		}
+		paid := &Swap{Hash: swapHash, State: swap.Paid,
+			Preimage: knownPreimage}
+		if ev, ok, err := d.Resume(ctx, paid); !ok || err != nil ||
+			ev != swap.IncomingUnsettleable {
+
+			t.Errorf("%v, paid with the claim gone: %v %v %v", st, ev,
+				ok, err)
+		}
+
+		// It fails: the refund stands.
+		out.lookup = node.Payment{State: node.PaymentFailed}
+		if ev, ok, err := d.Resume(ctx, sw); !ok || err != nil ||
+			ev != swap.IncomingCancelled {
+
+			t.Errorf("%v, then failed: %v %v %v", st, ev, ok, err)
+		}
+	}
+}

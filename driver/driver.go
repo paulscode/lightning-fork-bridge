@@ -204,10 +204,18 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 			return 0, false, fmt.Errorf("reading the outgoing payment: %w",
 				err)
 		}
-		if pmt.State == node.PaymentSucceeded {
+		switch pmt.State {
+		case node.PaymentSucceeded:
 			recordOutgoing(sw, pmt.Preimage)
 
 			return swap.OutgoingSucceeded, true, nil
+
+		case node.PaymentInFlight:
+			// Not over, so the swap cannot end yet, even with the
+			// incoming HTLC already given back: the payment may still
+			// succeed, and that is a loss to record as one, not a
+			// refund. It waits for the payment to settle either way.
+			return 0, false, nil
 		}
 	}
 
