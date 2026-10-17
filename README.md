@@ -186,6 +186,25 @@ how the earlier attempt ended.
 measure, a node it cannot reach, or a journal that has gone. A bridge in any of those states is up and
 unable to do anything, and reporting "ok" is how that goes unnoticed.
 
+Three things about the nodes and the host the daemon cannot check for itself:
+
+- `margin.HoldExpiryDelta` must be at least the incoming nodes'
+  `invoices.holdexpirydelta` (18 by default in lnd). The node cancels an
+  accepted hold invoice that many blocks before its HTLC expires, and the
+  margin counts only the blocks before that; a delta in the policy smaller
+  than the node's counts blocks the node has already given up.
+- The journal is locked with `flock`, which is advisory and keeps out only
+  processes that ask for it, and on NFS and some other network filesystems
+  may not lock at all. Keep the journal on a local filesystem, and run one
+  daemon on it.
+- lnd's `gc-canceled-invoices-on-startup` and
+  `gc-canceled-invoices-on-the-fly` delete cancelled invoices, including
+  the bridge's cancelled hold invoices. A new quote for an invoice whose
+  earlier attempt expired checks the node's cancelled hold invoice for the
+  HTLCs it held, as a backstop to the journal; with it deleted that check has
+  nothing to read, and the quote is refused as `funded_before`. Leave both
+  off on the incoming nodes.
+
 ## Upgrading
 
 A configuration is checked whole at startup, and every fault is reported at
