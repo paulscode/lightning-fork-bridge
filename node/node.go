@@ -57,6 +57,12 @@ type Route struct {
 	FeeMsat uint64
 }
 
+// BlockPadding is what lnd's SendPaymentV2 adds to the final hop's CLTV delta
+// before it checks a route against the payment's CLTV limit
+// (routing.BlockPadding), and QueryRoutes does not. A route found within a
+// limit pays within it only if it was asked for within the limit less this.
+const BlockPadding = 3
+
 // RouteFinder is an Outgoing node that can say, before anything is committed,
 // whether it has a route to an invoice's destination within a routing budget
 // and a CLTV limit. Optional: a quote asks one when the paying node is one,

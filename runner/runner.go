@@ -84,6 +84,10 @@ type Runner struct {
 	// PayTimeout bounds one outgoing attempt. Zero means two minutes.
 	PayTimeout time.Duration
 
+	// RouteTimeout bounds asking the paying node for a route at the gate.
+	// Zero means DefaultRouteTimeout.
+	RouteTimeout time.Duration
+
 	// FundedGrace is how long past its quote's expiry a funded swap may wait
 	// to be paid before it is given back instead. Zero means
 	// DefaultFundedGrace.
@@ -501,6 +505,11 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 		}
 	}
 
+	// The last checks before the margin: the paying node has a route now,
+	// and the outgoing invoice stays payable. Both are asked before Gate so
+	// that the margin decision is the last thing between the gate and
+	// recording Paying, however long these take.
+	//
 	// The outgoing invoice has to stay payable for the whole attempt. One
 	// that lapses while the payment is out is refused by the paying node,
 	// and the swap would wait in Paying on an answer that is not a
@@ -522,6 +531,14 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 		return true, r.carryOut(ctx, sw, action, log)
 	}
 
+	// A node that has just restarted answers RPCs before its channels are
+	// up, and a payment sent then fails at once for want of a route, which
+	// gives the payer's funds back for a swap that a few seconds later
+	// would have paid. No route is a reason to wait, not to fail.
+	if err := r.routable(ctx, sw); err != nil {
+		return false, err
+	}
+
 	event, err := r.Driver.Gate(ctx, sw, rates)
 	if err != nil {
 		// Gate returns MarginRefused alongside its errors, but acting on a
@@ -530,17 +547,6 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 		return false, fmt.Errorf("gate: %w", err)
 	}
 	log.Info("gated", "decision", event.String())
-
-	// The last check before Paying is recorded: the paying node has a route
-	// now. A node that has just restarted answers RPCs before its channels
-	// are up, and a payment sent then fails at once for want of a route,
-	// which gives the payer's funds back for a swap that a few seconds
-	// later would have paid. No route is a reason to wait, not to fail.
-	if event == swap.MarginPassed {
-		if err := r.routable(ctx, sw); err != nil {
-			return false, err
-		}
-	}
 
 	action, err := r.apply(ctx, sw, event, log)
 	if err != nil {
@@ -585,19 +591,44 @@ func (r *Runner) payable(ctx context.Context, sw *driver.Swap) (bool, error) {
 	return dec.Expiry.Sub(r.now()) >= r.payTimeout()+ExpirySlack, nil
 }
 
+// DefaultRouteTimeout bounds asking the paying node for a route at the gate.
+// A node that takes longer is not ready to pay, and the swap waits.
+const DefaultRouteTimeout = 30 * time.Second
+
+func (r *Runner) routeTimeout() time.Duration {
+	if r.RouteTimeout > 0 {
+		return r.RouteTimeout
+	}
+
+	return DefaultRouteTimeout
+}
+
 // routable asks the paying node, when it can be asked, for a route within the
-// swap's routing budget and CLTV limit: the same question the quote asked.
-// Any failure, no route included, is errNotReady, which waits at the not-sent
+// swap's routing budget and CLTV limit, less the padding the payment adds to
+// it (node.BlockPadding): the same question the quote asked. Any failure, no
+// route and a timeout included, is errNotReady, which waits at the not-sent
 // pace; the funded grace gives the swap back if a route never appears.
 func (r *Runner) routable(ctx context.Context, sw *driver.Swap) error {
 	finder, ok := r.Driver.Out.(node.RouteFinder)
 	if !ok {
 		return nil
 	}
-	if _, err := finder.FindRoute(ctx, sw.Invoice, sw.MaxFeeMsat,
-		sw.OutgoingCLTVLimit); err != nil {
+	if sw.OutgoingCLTVLimit <= node.BlockPadding {
+		return fmt.Errorf("%w: a CLTV limit of %d leaves no route room "+
+			"for the payment's padding", errNotReady, sw.OutgoingCLTVLimit)
+	}
 
-		return fmt.Errorf("%w: no route to pay on yet: %w", errNotReady,
+	asking, cancel := context.WithTimeout(ctx, r.routeTimeout())
+	defer cancel()
+	if _, err := finder.FindRoute(asking, sw.Invoice, sw.MaxFeeMsat,
+		sw.OutgoingCLTVLimit-node.BlockPadding); err != nil {
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// Not wrapped: a lookup that ran out of its time is the node
+		// being slow, and must not read as the runner being stopped.
+		return fmt.Errorf("%w: no route to pay on yet: %v", errNotReady,
 			err)
 	}
 

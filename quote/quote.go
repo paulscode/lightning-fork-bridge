@@ -165,8 +165,9 @@ type Quote struct {
 // (routing.BlockPadding): the limit has to exceed the delta by more than this.
 // QueryRoutes checks without it, so an invoice whose final hop leaves three
 // blocks or fewer under the limit finds a route at quote time and is then
-// refused by the node when it is paid.
-const BlockPadding = 3
+// refused by the node when it is paid; and a route is asked for within the
+// limit less this.
+const BlockPadding = node.BlockPadding
 
 // RouteSlack is added to the CLTV of the route a paying node found, for the
 // swap's limit: a route that changes a little between the quote and the
@@ -566,8 +567,10 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 	// of the payer rather than the whole budget.
 	terms.OutgoingCLTVLimit = budget
 	if finder, ok := q.Out.(node.RouteFinder); ok {
+		// Within the budget less the padding the payment will add,
+		// which the budget check above leaves room for.
 		route, err := finder.FindRoute(ctx, invoice, terms.MaxFeeMsat,
-			budget)
+			budget-BlockPadding)
 		switch {
 		case errors.Is(err, node.ErrNoRoute):
 			return Quote{}, fmt.Errorf("%w: %w: within %d msat of fees "+

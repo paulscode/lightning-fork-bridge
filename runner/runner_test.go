@@ -1395,15 +1395,31 @@ type routedOut struct {
 	early   int
 	decodes int32
 	decode  error
+
+	// cltv is the limit the last route was sought within, and hang, when
+	// set, has a lookup wait for its context instead of answering.
+	cltv uint32
+	hang func(n int) bool
 }
 
-func (r *routedOut) FindRoute(context.Context, string, uint64, uint32) (
-	node.Route, error) {
+func (r *routedOut) FindRoute(ctx context.Context, _ string, _ uint64,
+	cltvLimit uint32) (node.Route, error) {
+
+	r.mu.Lock()
+	r.asked++
+	n := r.asked
+	r.cltv = cltvLimit
+	hang := r.hang != nil && r.hang(n)
+	r.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+
+		return node.Route{}, ctx.Err()
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.asked++
-	if err := r.route(r.asked); err != nil {
+	if err := r.route(n); err != nil {
 		return node.Route{}, err
 	}
 	r.routed = true
@@ -1571,5 +1587,107 @@ func TestAnUnreadableInvoiceIsRetriedAtTheNotSentPace(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&out.paid); n != 0 {
 		t.Errorf("paid %d times", n)
+	}
+}
+
+// TestTheGateAsksForARouteWithinTheLimitLessPadding: lnd's payment adds
+// node.BlockPadding to the final hop before checking the route against the
+// limit, and QueryRoutes does not, so the route is sought within the limit
+// less that.
+func TestTheGateAsksForARouteWithinTheLimitLessPadding(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &routedOut{fakeOut: &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}}, route: func(int) error { return nil }}
+	r, _ := build(t, in, out.fakeOut, record(swap.Funded))
+	r.Driver.Out = out
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+	if want := record(swap.Funded).OutgoingCLTVLimit -
+		node.BlockPadding; out.cltv != want {
+
+		t.Errorf("sought a route within %d blocks, want %d", out.cltv,
+			want)
+	}
+}
+
+// TestTheMarginIsTheLastCheckBeforePaying: the route lookup can take a while,
+// and the margin decided before it would be a decision on blocks that have
+// since passed. The route is asked for first, and the margin is decided on
+// the chain as it is after: here the lookup takes long enough for the HTLC
+// to run short, and the swap is given back rather than paid.
+func TestTheMarginIsTheLastCheckBeforePaying(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &routedOut{fakeOut: &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}}}
+	out.route = func(int) error {
+		// Blocks pass while the node looks: the HTLC now expires in
+		// ten, far under what the margin needs.
+		in.set(func(f *fakeIn) { f.height = 990 })
+
+		return nil
+	}
+	r, st := build(t, in, out.fakeOut, record(swap.Funded))
+	r.Driver.Out = out
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Aborted {
+		t.Errorf("ended %v, want aborted", final.State)
+	}
+	if n := atomic.LoadInt32(&out.paid); n != 0 {
+		t.Errorf("paid %d times on a margin decided before the route", n)
+	}
+}
+
+// TestASlowRouteLookupWaitsRatherThanHangs: a paying node that does not
+// answer a route lookup is not ready to pay. The lookup is bounded, the swap
+// waits and asks again, and pays once the node answers; nothing stops it.
+func TestASlowRouteLookupWaitsRatherThanHangs(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &routedOut{fakeOut: &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}}, route: func(int) error { return nil },
+		hang: func(n int) bool { return n == 1 }}
+	r, st := build(t, in, out.fakeOut, record(swap.Funded))
+	r.Driver.Out = out
+	r.RouteTimeout = 20 * time.Millisecond
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Settled {
+		t.Errorf("ended %v, want settled", final.State)
+	}
+	out.mu.Lock()
+	asked := out.asked
+	out.mu.Unlock()
+	if asked < 2 {
+		t.Errorf("asked for a route %d times, want again after the first "+
+			"timed out", asked)
 	}
 }

@@ -822,7 +822,8 @@ func TestNoRouteIsRefusedBeforeAnythingIsCreated(t *testing.T) {
 	if _, err := st.Get(ctx, hash); err == nil {
 		t.Error("a swap was recorded")
 	}
-	if out.cltv != DefaultPolicy.OutgoingCLTVLimit {
+	// Less the padding the payment adds, which QueryRoutes does not.
+	if out.cltv != DefaultPolicy.OutgoingCLTVLimit-BlockPadding {
 		t.Errorf("asked for routes within %d blocks", out.cltv)
 	}
 	if out.maxFee != 300_000 {
@@ -932,9 +933,11 @@ func TestTheRouteIsSoughtWithinWhatTheChainsAllowNow(t *testing.T) {
 		t.Fatal(err)
 	}
 	allowed, _ := margin.MaxOutgoingBlocks(blake, btc, marg)
-	if out.cltv != allowed || allowed >= 100_000 || allowed == 0 {
-		t.Errorf("sought within %d blocks, the chains allow %d", out.cltv,
-			allowed)
+	if out.cltv != allowed-BlockPadding || allowed >= 100_000 ||
+		allowed == 0 {
+
+		t.Errorf("sought within %d blocks, the chains allow %d less %d",
+			out.cltv, allowed, BlockPadding)
 	}
 }
 
