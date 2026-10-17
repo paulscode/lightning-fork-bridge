@@ -1,6 +1,7 @@
 package bridged
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -727,5 +728,31 @@ func TestEachDirectionPricesFromTheCautiousMiddleReading(t *testing.T) {
 
 		t.Errorf("paid at %v (%v); the higher reading inverted does not "+
 			"cover it", ok, err)
+	}
+}
+
+// TestARunnerAlertIsLoggedAsAnError: the runner raises a swap it keeps
+// meeting contradictions on through Alert, and the daemon has no other way to
+// reach an operator than its log, at error level.
+func TestARunnerAlertIsLoggedAsAnError(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	s := testService(t, &fakeOut{accepts: "lnbc"}, nil, nil)
+	s.log = slog.New(slog.NewTextHandler(&buf, nil))
+
+	built := s.build("toBitcoin", Direction{Inventory: inventoryForTest()},
+		nil, nil, s.sides[0].balance, inventory.Draining, false, nil)
+	if built.runner.Alert == nil {
+		t.Fatal("the runner has no alert")
+	}
+	built.runner.Alert(node.Hash{0xab}, "the paying node contradicted itself")
+
+	out := buf.String()
+	if !strings.Contains(out, "level=ERROR") ||
+		!strings.Contains(out, "contradicted itself") ||
+		!strings.Contains(out, "ab00") {
+
+		t.Errorf("logged %q", out)
 	}
 }

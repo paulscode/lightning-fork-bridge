@@ -254,6 +254,11 @@ func (s *Service) build(name string, d Direction, inConn, outConn *grpc.ClientCo
 		Store: s.journal, Rates: runner.Rates(s.spacing(invert)),
 		PriceCheck: s.priceCheck(sd),
 		Log:        s.log.With("direction", name),
+		Alert: func(hash node.Hash, why string) {
+			s.log.Error("operator alert: a swap needs attention",
+				"direction", name, "hash", fmt.Sprintf("%x", hash),
+				"why", why)
+		},
 	}
 
 	return sd
