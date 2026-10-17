@@ -42,6 +42,11 @@ func recorded(t *testing.T, in node.Incoming, out node.Outgoing,
 // machine's answer is to cancel the incoming claim — against money that has
 // already gone out. Write first, and the record says paying, the bridge asks
 // the outgoing node instead of re-deciding, and it settles.
+//
+// The cancel itself now asks the paying node once more before it gives a
+// claim up (Do refuses with ErrStillPaying), so the counterfactual is caught
+// there too. That is a second line, not the first: it rests on the node's
+// lookup, where the ordering rule rests on nothing but the record.
 func TestTheOrderingRuleIsWhatPreventsTheLoss(t *testing.T) {
 	ctx := context.Background()
 
@@ -84,25 +89,26 @@ func TestTheOrderingRuleIsWhatPreventsTheLoss(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// This is the loss: the machine's answer is to cancel the claim
+		// on the incoming HTLC, while the outgoing node holds a succeeded
+		// payment for the same hash.
 		if action != swap.CancelIncoming {
 			t.Fatalf("want CancelIncoming, got %v", action)
-		}
-		if err := d.Do(ctx, sw, action); err != nil {
-			t.Fatal(err)
-		}
-
-		// This is the loss. The claim on the incoming HTLC has been given
-		// up, and the outgoing node holds a succeeded payment for the same
-		// hash.
-		if in.cancelled != 1 {
-			t.Fatal("expected the counterfactual to cancel")
 		}
 		pmt, _ := out.LookupPayment(ctx, sw.Hash)
 		if pmt.State != node.PaymentSucceeded {
 			t.Fatal("the premise of this test is that the payment succeeded")
 		}
-		t.Logf("with the record behind: cancelled the claim on %d msat "+
-			"against a payment that had already left", sw.IncomingMsat)
+		t.Logf("with the record behind: decided to cancel the claim on %d "+
+			"msat against a payment that had already left", sw.IncomingMsat)
+
+		// The second line holds it: the cancel asks the paying node first.
+		if err := d.Do(ctx, sw, action); !errors.Is(err, ErrStillPaying) {
+			t.Fatalf("want ErrStillPaying, got %v", err)
+		}
+		if in.cancelled != 0 {
+			t.Fatal("the claim was cancelled against a succeeded payment")
+		}
 	})
 
 	t.Run("recording before the payment keeps it", func(t *testing.T) {

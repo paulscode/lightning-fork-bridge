@@ -1158,3 +1158,68 @@ func TestAnOutgoingInvoiceExpiringDuringThePaymentIsNotPaid(t *testing.T) {
 		})
 	}
 }
+
+// TestACancelAsksThePayingNodeFirst: before a failing or aborting swap gives
+// its incoming HTLC back, the paying node must say the payment never started
+// or failed. One that succeeded after all makes the swap paid and settles the
+// claim; one still in flight keeps it, and the swap waits.
+func TestACancelAsksThePayingNodeFirst(t *testing.T) {
+	for _, c := range []struct {
+		state  swap.State
+		lookup node.Payment
+		want   swap.State
+	}{
+		{swap.Failing, node.Payment{State: node.PaymentSucceeded,
+			Preimage: preimage}, swap.Settled},
+		{swap.Aborting, node.Payment{State: node.PaymentSucceeded,
+			Preimage: preimage}, swap.Settled},
+		{swap.Failing, node.Payment{State: node.PaymentInFlight},
+			swap.Failing},
+		{swap.Aborting, node.Payment{State: node.PaymentInFlight},
+			swap.Aborting},
+		{swap.Failing, node.Payment{State: node.PaymentFailed},
+			swap.Failed},
+		{swap.Aborting, node.Payment{State: node.PaymentNone},
+			swap.Aborted},
+	} {
+		name := fmt.Sprintf("%v, payment %v", c.state, c.lookup.State)
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(),
+				200*time.Millisecond)
+			defer cancel()
+
+			in := &fakeIn{
+				invoice: node.Invoice{State: node.InvoiceAccepted,
+					ExpiryHeight: 1000},
+				height: 500,
+			}
+			out := &fakeOut{lookup: c.lookup}
+			r, st := build(t, in, out, record(c.state))
+
+			err := r.Drive(ctx, hash)
+			if c.want.Terminal() && err != nil {
+				t.Fatal(err)
+			}
+
+			final, _ := st.Get(context.Background(), hash)
+			if final.State != c.want {
+				t.Fatalf("ended in %v, want %v", final.State, c.want)
+			}
+			settled, cancelled := in.counts()
+			switch c.want {
+			case swap.Settled:
+				if settled != 1 || cancelled != 0 {
+					t.Errorf("settled %d, cancelled %d", settled,
+						cancelled)
+				}
+				if final.Preimage != preimage {
+					t.Error("the preimage was not recorded")
+				}
+			case swap.Failing, swap.Aborting:
+				if cancelled != 0 {
+					t.Error("cancelled while the payment was in flight")
+				}
+			}
+		})
+	}
+}

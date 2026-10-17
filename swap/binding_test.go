@@ -52,14 +52,18 @@ func TestOnlySequencedNeedsThePreimageUpfront(t *testing.T) {
 func TestSettleIsOnlyEverReachableFromPaid(t *testing.T) {
 	// The action is emitted on the transition *into* Paid, so that is what
 	// has to be pinned: the only move that authorises a settle is the
-	// outgoing leg definitively succeeding.
+	// outgoing leg definitively succeeding. That is learned while paying,
+	// or, should a payment succeed after all, while cancelling: the driver
+	// asks the paying node before it gives up a failing or aborting swap's
+	// claim.
+	paidFrom := map[State]bool{Paying: true, Failing: true, Aborting: true}
 	for _, s := range allStates {
 		for _, e := range allEvents {
 			next, action, err := Step(s, e)
 			if err != nil || action != SettleIncoming {
 				continue
 			}
-			if s != Paying || e != OutgoingSucceeded || next != Paid {
+			if !paidFrom[s] || e != OutgoingSucceeded || next != Paid {
 				t.Errorf("SettleIncoming is authorised by %v on %v (to %v), "+
 					"so the recipient is not guaranteed to have been paid "+
 					"first", e, s, next)
@@ -74,7 +78,7 @@ func TestSettleIsOnlyEverReachableFromPaid(t *testing.T) {
 			if err != nil || next != Paid {
 				continue
 			}
-			if s != Paying || e != OutgoingSucceeded {
+			if !paidFrom[s] || e != OutgoingSucceeded {
 				t.Errorf("Paid is reachable by %v on %v, so the recipient is "+
 					"not guaranteed to have been paid first", e, s)
 			}

@@ -82,7 +82,9 @@ func TestCancelOnlyWhenNothingIsOwed(t *testing.T) {
 }
 
 // TestSettleOnlyWithAPreimage: the incoming HTLC may only be claimed once the
-// outgoing leg has produced the preimage.
+// outgoing leg has produced the preimage. Besides Paying, that can be found out
+// while cancelling: the driver asks the paying node before giving up a claim,
+// and a payment that succeeded after all is settled, not cancelled.
 func TestSettleOnlyWithAPreimage(t *testing.T) {
 	for _, s := range allStates {
 		for _, e := range allEvents {
@@ -90,7 +92,8 @@ func TestSettleOnlyWithAPreimage(t *testing.T) {
 			if err != nil || action != SettleIncoming {
 				continue
 			}
-			if s != Paying || e != OutgoingSucceeded {
+			if e != OutgoingSucceeded ||
+				(s != Paying && s != Failing && s != Aborting) {
 				t.Errorf("%v on %v settles the incoming HTLC without the "+
 					"preimage having been learned", e, s)
 			}
@@ -491,6 +494,24 @@ func TestOutgoingNotSentReturnsToFunded(t *testing.T) {
 		}
 		if _, _, err := Step(s, OutgoingNotSent); err == nil {
 			t.Errorf("not sent moved %v", s)
+		}
+	}
+}
+
+// TestACancelThatFindsThePaymentSucceededSettles: the driver asks the paying
+// node before it cancels a failing or aborting swap's incoming HTLC, and a
+// payment that succeeded after all makes the swap paid, settling the claim
+// rather than giving it away.
+func TestACancelThatFindsThePaymentSucceededSettles(t *testing.T) {
+	for _, s := range []State{Failing, Aborting} {
+		next, action, err := Step(s, OutgoingSucceeded)
+		if err != nil {
+			t.Fatalf("%v on %v: %v", OutgoingSucceeded, s, err)
+		}
+		if next != Paid || action != SettleIncoming {
+			t.Errorf("%v on %v moves to %v and asks for %v, want %v and "+
+				"%v", OutgoingSucceeded, s, next, action, Paid,
+				SettleIncoming)
 		}
 	}
 }

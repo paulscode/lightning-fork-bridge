@@ -292,6 +292,15 @@ var table = map[key]outcome{
 	{Paid, IncomingUnsettleable}:  {Lost, Nothing},
 	{Failing, IncomingCancelled}:  {Failed, Nothing},
 	{Aborting, IncomingCancelled}: {Aborted, Nothing},
+
+	// A cancel that finds the outgoing leg paid after all. Failing follows
+	// a definitive failure and Aborting a payment that never left, so this
+	// should not happen; but the driver asks the paying node before every
+	// such cancel, and if the payment did succeed its preimage is the
+	// bridge's claim, which cancelling would give away. The swap is paid,
+	// and is settled like any other.
+	{Failing, OutgoingSucceeded}:  {Paid, SettleIncoming},
+	{Aborting, OutgoingSucceeded}: {Paid, SettleIncoming},
 	{Expiring, IncomingCancelled}: {Expired, Nothing},
 
 	// A hold invoice that lapses on its own while being cancelled reaches

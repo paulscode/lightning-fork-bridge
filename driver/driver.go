@@ -40,6 +40,14 @@ var (
 	// ErrStaleRates is returned when the block-spacing measurement handed to
 	// Gate is too old to decide on.
 	ErrStaleRates = errors.New("block spacing measurement is stale")
+
+	// ErrStillPaying is returned instead of cancelling an incoming HTLC
+	// when the paying node does not say the outgoing payment is over and
+	// unpaid: it is in flight, it succeeded, or the node could not be
+	// asked. Transient: the next look at the swap decides it again, and a
+	// payment that succeeded moves it to Paid (see Resume).
+	ErrStillPaying = errors.New("the outgoing payment is not known to " +
+		"have failed, so the incoming HTLC is kept")
 )
 
 // Swap is the record the driver works from.
@@ -185,6 +193,23 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 		return d.resumePaying(ctx, sw)
 	}
 
+	// A swap cancelling its incoming HTLC may have been paying before. If
+	// the payment succeeded after all, that is what happened, whatever the
+	// invoice is doing: the swap is paid, and settles, or is lost if the
+	// claim is already gone.
+	if cancelsAfterPaying(sw.State) {
+		pmt, err := d.Out.LookupPayment(ctx, sw.Outgoing())
+		if err != nil {
+			return 0, false, fmt.Errorf("reading the outgoing payment: %w",
+				err)
+		}
+		if pmt.State == node.PaymentSucceeded {
+			recordOutgoing(sw, pmt.Preimage)
+
+			return swap.OutgoingSucceeded, true, nil
+		}
+	}
+
 	// Everything else is decided by what the incoming node says.
 	inv, err := d.In.LookupInvoice(ctx, sw.Hash)
 	if err != nil {
@@ -317,6 +342,9 @@ func (d *Driver) Do(ctx context.Context, sw *Swap, a swap.Action) error {
 			return fmt.Errorf("%w: refusing to cancel while %v",
 				ErrState, sw.State)
 		}
+		if err := d.notPaying(ctx, sw); err != nil {
+			return err
+		}
 
 		return d.In.CancelInvoice(ctx, sw.Hash)
 
@@ -358,6 +386,41 @@ func (d *Driver) Do(ctx context.Context, sw *Swap, a swap.Action) error {
 	}
 
 	return fmt.Errorf("%w: unknown action %v", ErrState, a)
+}
+
+// cancelsAfterPaying reports whether a state cancels the incoming HTLC and may
+// have been paying before: Failing always was, and Aborting may have been,
+// through a payment the paying node never received.
+func cancelsAfterPaying(s swap.State) bool {
+	return s == swap.Failing || s == swap.Aborting
+}
+
+// notPaying is the last check before an incoming HTLC is given back: the
+// paying node must say the outgoing payment never started or definitively
+// failed.
+//
+// The state machine already allows a cancel only after a definitive failure,
+// or before anything was sent. This guards the readings of the node it rests
+// on: a failure reported for a payment that then succeeded, a payment taken
+// for never sent that had in fact left. Either would cancel the bridge's only
+// claim against money already gone, and asking costs one lookup.
+func (d *Driver) notPaying(ctx context.Context, sw *Swap) error {
+	if !cancelsAfterPaying(sw.State) {
+		return nil
+	}
+
+	pmt, err := d.Out.LookupPayment(ctx, sw.Outgoing())
+	if err != nil {
+		return fmt.Errorf("%w: reading the outgoing payment before "+
+			"cancelling: %w", ErrStillPaying, err)
+	}
+	switch pmt.State {
+	case node.PaymentNone, node.PaymentFailed:
+		return nil
+	}
+
+	return fmt.Errorf("%w: %v while %v", ErrStillPaying, pmt.State,
+		sw.State)
 }
 
 // Pay sends the outgoing payment and reports the event its outcome implies.
