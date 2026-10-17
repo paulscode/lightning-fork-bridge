@@ -448,6 +448,25 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 		}
 	}
 
+	// The outgoing invoice has to stay payable for the whole attempt. One
+	// that lapses while the payment is out is refused by the paying node,
+	// and the swap would wait in Paying on an answer that is not a
+	// payment; refusing now gives the payer's funds back instead.
+	if ok, err := r.payable(ctx, sw); err != nil {
+		// Waiting, as for the price: a node that could not read the
+		// invoice says nothing about it, and the funded grace gives the
+		// swap back if it never can.
+		return false, fmt.Errorf("reading the outgoing invoice: %w", err)
+	} else if !ok {
+		log.Info("gated", "decision", "outgoing invoice expires too soon")
+		action, err := r.apply(ctx, sw, swap.MarginRefused, log)
+		if err != nil {
+			return false, err
+		}
+
+		return true, r.carryOut(ctx, sw, action, log)
+	}
+
 	event, err := r.Driver.Gate(ctx, sw, rates)
 	if err != nil {
 		// Gate returns MarginRefused alongside its errors, but acting on a
@@ -473,6 +492,31 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 	}
 
 	return true, nil
+}
+
+// ExpirySlack is how long past the end of a payment attempt the outgoing
+// invoice must still be payable for the attempt to start: the attempt's own
+// timeout bounds it, and this covers the clocks of the bridge, the paying node
+// and the invoice's issuer disagreeing by a little.
+const ExpirySlack = time.Minute
+
+// payable reports whether the outgoing invoice stays payable for a whole
+// attempt plus ExpirySlack, read by the node that will pay it. An invoice with
+// no readable expiry is not: the quote refused those, so one here means
+// something changed, and paying against it would be the permissive reading.
+func (r *Runner) payable(ctx context.Context, sw *driver.Swap) (bool, error) {
+	if r.Driver.Out == nil {
+		return false, fmt.Errorf("%w: no outgoing node", ErrConfig)
+	}
+	dec, err := r.Driver.Out.Decode(ctx, sw.Invoice)
+	if err != nil {
+		return false, err
+	}
+	if dec.Expiry.IsZero() {
+		return false, nil
+	}
+
+	return dec.Expiry.Sub(r.now()) >= r.payTimeout()+ExpirySlack, nil
 }
 
 // pay sends the outgoing leg. By the time it is called the record already says

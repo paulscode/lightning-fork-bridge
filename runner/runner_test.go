@@ -132,6 +132,10 @@ type fakeOut struct {
 	// it one fake serves every swap in a Resume test, and a preimage from
 	// one swap comes back as the answer for another.
 	lookups map[node.Hash]node.Payment
+
+	// expiry is when the outgoing invoice stops being payable. Zero means
+	// a day after the test clock's now.
+	expiry time.Time
 }
 
 func (f *fakeOut) Pay(ctx context.Context, _ node.PayRequest) (node.Payment,
@@ -172,7 +176,14 @@ func (f *fakeOut) LookupPayment(_ context.Context, hash node.Hash) (
 // Decode reads a payment request. The bridge uses the paying node's own
 // decoder so that no second parser can disagree about the payment hash.
 func (f *fakeOut) Decode(context.Context, string) (node.Decoded, error) {
-	return node.Decoded{}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.expiry.IsZero() {
+		return node.Decoded{Expiry: now.Add(24 * time.Hour)}, nil
+	}
+
+	return node.Decoded{Expiry: f.expiry}, nil
 }
 
 func (f *fakeOut) BlockHeight(context.Context) (int32, error) { return 0, nil }
@@ -1093,5 +1104,57 @@ func TestAPriceThatStillCoversThePayoutPays(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&out.paid); n != 1 {
 		t.Errorf("paid %d times", n)
+	}
+}
+
+// TestAnOutgoingInvoiceExpiringDuringThePaymentIsNotPaid: an invoice that
+// lapses while the payment is out is refused by the paying node, and the swap
+// would wait in Paying for an answer that is not a payment. The gate gives the
+// payer's funds back instead when the invoice does not outlive a whole attempt
+// and ExpirySlack, and pays when it does.
+func TestAnOutgoingInvoiceExpiringDuringThePaymentIsNotPaid(t *testing.T) {
+	const timeout = 2 * time.Minute
+
+	for _, c := range []struct {
+		name string
+		left time.Duration
+		want swap.State
+	}{
+		{"already expired", -time.Minute, swap.Aborted},
+		{"inside the attempt", timeout / 2, swap.Aborted},
+		{"inside the slack", timeout + ExpirySlack - time.Second,
+			swap.Aborted},
+		{"outlives both", timeout + ExpirySlack, swap.Settled},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := deadline(t)
+			defer cancel()
+
+			in := &fakeIn{
+				invoice: node.Invoice{State: node.InvoiceAccepted,
+					ExpiryHeight: 1000},
+				height: 500,
+			}
+			out := &fakeOut{payment: node.Payment{
+				State: node.PaymentSucceeded, Preimage: preimage,
+			}, expiry: now.Add(c.left)}
+			r, st := build(t, in, out, record(swap.Funded))
+			r.PayTimeout = timeout
+
+			if err := r.Drive(ctx, hash); err != nil {
+				t.Fatal(err)
+			}
+
+			final, _ := st.Get(context.Background(), hash)
+			if final.State != c.want {
+				t.Fatalf("ended in %v, want %v", final.State, c.want)
+			}
+			paid := atomic.LoadInt32(&out.paid)
+			_, cancelled := in.counts()
+			if c.want == swap.Aborted && (paid != 0 || cancelled != 1) {
+				t.Errorf("paid %d times and cancelled %d, want no "+
+					"payment and one cancel", paid, cancelled)
+			}
+		})
 	}
 }
