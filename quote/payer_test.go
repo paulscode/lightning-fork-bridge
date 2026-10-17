@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -687,5 +688,76 @@ func TestAQuoteSaysWhenItsInvoiceExists(t *testing.T) {
 		rec.State != swap.Offered {
 
 		t.Errorf("offered: %v, no invoice %v", rec.State, rec.NoInvoice)
+	}
+}
+
+// TestConcurrentQuotesCannotOversell: two quotes, each fitting the room alone
+// and not together, both pass the first look at the room before either is
+// recorded. The room is looked at again with the record written under one
+// lock, so only one is quoted; the other is refused for liquidity rather than
+// sold money already promised.
+func TestConcurrentQuotesCannotOversell(t *testing.T) {
+	ctx := context.Background()
+	q, st, _ := limited(t, Limits{})
+
+	// Room for one 100,000 sat payout with its routing budget, not two.
+	// Having read the room the second time, a quote waits a little for the
+	// other's second read, which only comes if nothing holds it back, so
+	// that two reads that can overlap do.
+	const balance = 150_000_000
+	var looks, seconds atomic.Int32
+	both := make(chan struct{})
+	q.Room = func(ctx context.Context) (uint64, error) {
+		committed, err := store.Committed(ctx, st)
+		if err != nil || committed > balance {
+			return 0, err
+		}
+		if looks.Add(1) > 2 {
+			if seconds.Add(1) == 2 {
+				close(both)
+			}
+			select {
+			case <-both:
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+
+		return balance - committed, nil
+	}
+	// Both are priced, so past the first look at the room, before either
+	// goes on.
+	var priced sync.WaitGroup
+	priced.Add(2)
+	q.Price = func(context.Context) (rate.Reading, error) {
+		priced.Done()
+		priced.Wait()
+
+		return reading(0.01), nil
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = q.QuoteFor(ctx, fmt.Sprintf("p%d", i),
+				fmt.Sprintf("lnbc1-%d", i))
+		}()
+	}
+	wg.Wait()
+
+	pending, _ := st.Pending(ctx)
+	if len(pending) != 1 {
+		t.Fatalf("%d swaps recorded with room for one", len(pending))
+	}
+	refused := 0
+	for _, err := range errs {
+		if errors.Is(err, ErrNoLiquidity) {
+			refused++
+		}
+	}
+	if refused != 1 {
+		t.Errorf("refusals %v, want one for liquidity", errs)
 	}
 }

@@ -232,6 +232,13 @@ type Quoter struct {
 	mu      sync.Mutex
 	quoting map[node.Hash]struct{}
 
+	// roomMu is held from the last headroom check to the record that
+	// commits the swap's amount, so two quotes cannot both fit in room for
+	// one. It covers Room's own calls to the paying node and the journal
+	// write, and nothing else that waits on the network but forgetting an
+	// earlier attempt's invoice, which is rare.
+	roomMu sync.Mutex
+
 	// whoMu guards who, swept and each participant's users and recent.
 	whoMu sync.Mutex
 	// who is each participant quoting now or in the last minute. An entry
@@ -494,21 +501,11 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 		return Quote{}, err
 	}
 
-	// What the bridge can actually pay, which is not what its balance says:
-	// every swap already quoted, offered or funded is a claim on the same
-	// money. Checked after the duplicate guard so that the amount about to be
-	// committed is not already counted in it. The routing budget counts
-	// too: the payment leaves with its fees, and a swap that fits only
-	// without them is one the node cannot route.
-	room, err := q.Room(ctx)
-	if err != nil {
-		return Quote{}, fmt.Errorf("%w: %w", ErrRefused, err)
-	}
-	if need := dec.AmountMsat + q.feeBudget(dec.AmountMsat); need > room {
-		return Quote{}, fmt.Errorf("%w: %w: %d msat with its routing "+
-			"budget against %d msat of headroom; the rest is promised to "+
-			"swaps that have not finished", ErrRefused, ErrNoLiquidity,
-			need, room)
+	// A first look at the room, before the price and the route are worked
+	// out; checked again under roomMu just before the swap is recorded,
+	// which is the check that counts.
+	if err := q.fits(ctx, dec.AmountMsat); err != nil {
+		return Quote{}, err
 	}
 
 	reading, err := q.Price(ctx)
@@ -599,22 +596,84 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 	terms.CLTVDelta = blocks
 	terms.Expires = now.Add(q.Policy.Validity)
 
-	// Last, once everything else has said yes, so that a refused quote
-	// leaves the previous attempt's invoice where it was. Forgetting it
-	// first and then refusing would be harmless, since it was cancelled,
-	// but it would erase what an operator might want to look at.
-	if forget {
-		if err := q.In.ForgetInvoice(ctx, dec.Hash); err != nil {
-			return Quote{}, fmt.Errorf("clearing the previous attempt's "+
-				"cancelled invoice: %w", err)
-		}
+	rec, err := q.reserve(ctx, terms, who, now, forget)
+	if err != nil {
+		return Quote{}, err
 	}
-
-	if err := q.create(ctx, &terms, who, now); err != nil {
+	if err := q.offer(ctx, rec, &terms); err != nil {
 		return Quote{}, err
 	}
 
 	return terms, nil
+}
+
+// fits refuses a payout the bridge has no room for. What the bridge can
+// actually pay is not what its balance says: every swap already quoted,
+// offered or funded is a claim on the same money. Checked after the duplicate
+// guard so that the amount about to be committed is not already counted in
+// it. The routing budget counts too: the payment leaves with its fees, and a
+// swap that fits only without them is one the node cannot route.
+func (q *Quoter) fits(ctx context.Context, amountMsat uint64) error {
+	room, err := q.Room(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrRefused, err)
+	}
+	if need := amountMsat + q.feeBudget(amountMsat); need > room {
+		return fmt.Errorf("%w: %w: %d msat with its routing budget "+
+			"against %d msat of headroom; the rest is promised to swaps "+
+			"that have not finished", ErrRefused, ErrNoLiquidity, need,
+			room)
+	}
+
+	return nil
+}
+
+// reserve checks the room once more and records the swap, under roomMu, so
+// that the swap's amount is counted against the room before any other quote
+// looks at it.
+//
+// The previous attempt's invoice is forgotten here, once everything else has
+// said yes, so that a refused quote leaves it where it was. Forgetting it
+// first and then refusing would be harmless, since it was cancelled, but it
+// would erase what an operator might want to look at.
+func (q *Quoter) reserve(ctx context.Context, terms Quote, who string,
+	now time.Time, forget bool) (store.Record, error) {
+
+	q.roomMu.Lock()
+	defer q.roomMu.Unlock()
+
+	if err := q.fits(ctx, terms.OutgoingMsat); err != nil {
+		return store.Record{}, err
+	}
+	if forget {
+		if err := q.In.ForgetInvoice(ctx, terms.Hash); err != nil {
+			return store.Record{}, fmt.Errorf("clearing the previous "+
+				"attempt's cancelled invoice: %w", err)
+		}
+	}
+
+	rec := store.Record{
+		Hash:              terms.Hash,
+		State:             swap.Quoted,
+		OutgoingCLTVLimit: terms.OutgoingCLTVLimit,
+		Invoice:           terms.Outgoing,
+		IncomingMsat:      terms.IncomingMsat,
+		OutgoingMsat:      terms.OutgoingMsat,
+		MaxFeeMsat:        terms.MaxFeeMsat,
+		QuoteExpiry:       terms.Expires,
+		Rate:              terms.Rate,
+		Spread:            terms.Spread,
+		Created:           now,
+		Updated:           now,
+		Participant:       who,
+		NoPayAttempt:      true,
+		NoInvoice:         true,
+	}
+	if err := q.Store.Put(ctx, rec); err != nil {
+		return store.Record{}, fmt.Errorf("recording the quote: %w", err)
+	}
+
+	return rec, nil
 }
 
 // previous decides what an earlier swap for the same payment hash means for a
@@ -850,38 +909,17 @@ func (q *Quoter) feeBudget(amountMsat uint64) uint64 {
 	return fee
 }
 
-// create records the swap, then builds the hold invoice, then records that it
+// offer builds the hold invoice for a recorded swap, then records that it
 // exists.
 //
-// The record comes first for the same reason it does everywhere else: a crash
-// between creating the invoice and writing it down would leave an invoice on
-// the node that nothing is tracking, which a payer could fund and no one would
-// ever settle or cancel. Recording first makes that recoverable — the driver
-// finds a swap recorded as quoted whose invoice exists, and catches the record
-// up.
-func (q *Quoter) create(ctx context.Context, terms *Quote, who string,
-	now time.Time) error {
-
-	rec := store.Record{
-		Hash:              terms.Hash,
-		State:             swap.Quoted,
-		OutgoingCLTVLimit: terms.OutgoingCLTVLimit,
-		Invoice:           terms.Outgoing,
-		IncomingMsat:      terms.IncomingMsat,
-		OutgoingMsat:      terms.OutgoingMsat,
-		MaxFeeMsat:        terms.MaxFeeMsat,
-		QuoteExpiry:       terms.Expires,
-		Rate:              terms.Rate,
-		Spread:            terms.Spread,
-		Created:           now,
-		Updated:           now,
-		Participant:       who,
-		NoPayAttempt:      true,
-		NoInvoice:         true,
-	}
-	if err := q.Store.Put(ctx, rec); err != nil {
-		return fmt.Errorf("recording the quote: %w", err)
-	}
+// The record comes first (reserve) for the same reason it does everywhere
+// else: a crash between creating the invoice and writing it down would leave
+// an invoice on the node that nothing is tracking, which a payer could fund
+// and no one would ever settle or cancel. Recording first makes that
+// recoverable — the driver finds a swap recorded as quoted whose invoice
+// exists, and catches the record up.
+func (q *Quoter) offer(ctx context.Context, rec store.Record,
+	terms *Quote) error {
 
 	hold, err := q.In.AddHoldInvoice(ctx, node.HoldInvoice{
 		Hash:       terms.Hash,
