@@ -196,8 +196,9 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 	// A swap cancelling its incoming HTLC may have been paying before. If
 	// the payment succeeded after all, that is what happened, whatever the
 	// invoice is doing: the swap is paid, and settles, or is lost if the
-	// claim is already gone.
-	if cancelsAfterPaying(sw.State) {
+	// claim is already gone. One that never recorded Paying has no payment
+	// to ask about, and is not held up by a paying node that is down.
+	if cancelsAfterPaying(sw.State) && !sw.NoPayAttempt {
 		pmt, err := d.Out.LookupPayment(ctx, sw.Outgoing())
 		if err != nil {
 			return 0, false, fmt.Errorf("reading the outgoing payment: %w",
@@ -404,8 +405,11 @@ func cancelsAfterPaying(s swap.State) bool {
 // on: a failure reported for a payment that then succeeded, a payment taken
 // for never sent that had in fact left. Either would cancel the bridge's only
 // claim against money already gone, and asking costs one lookup.
+//
+// A swap that never recorded Paying (NoPayAttempt) has no payment to ask
+// about, so a paying node that is down does not hold up its refund.
 func (d *Driver) notPaying(ctx context.Context, sw *Swap) error {
-	if !cancelsAfterPaying(sw.State) {
+	if !cancelsAfterPaying(sw.State) || sw.NoPayAttempt {
 		return nil
 	}
 

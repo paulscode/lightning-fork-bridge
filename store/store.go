@@ -131,6 +131,14 @@ type Record struct {
 	// participant reserve the bridge's liquidity again simply by waiting
 	// for one.
 	Participant string
+
+	// NoPayAttempt is set when the swap is created and cleared in the same
+	// write that records it Paying, the first moment an outgoing payment
+	// may leave. While it is set no outgoing payment can exist, so giving
+	// the incoming HTLC back need not wait for the paying node to say there
+	// is none. A record without it, written before it existed or by hand,
+	// may have paid, and the paying node is asked as before.
+	NoPayAttempt bool
 }
 
 // Valid reports whether a record can be stored. It is deliberately narrow:

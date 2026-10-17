@@ -752,3 +752,71 @@ func TestSettlingBeforeThePaymentSucceededIsRefused(t *testing.T) {
 		t.Error("the settle did not reach the node")
 	}
 }
+
+// TestARefundNeverPaidDoesNotWaitForThePayingNode: a funded swap given back
+// before it ever recorded Paying has no outgoing payment, so cancelling its
+// incoming HTLC does not wait for a paying node that is down to say so; it
+// would otherwise hold the payer's funds until that node came back or the
+// hold invoice expired. One that has recorded Paying waits, as before.
+func TestARefundNeverPaidDoesNotWaitForThePayingNode(t *testing.T) {
+	ctx := context.Background()
+	down := &fakeOut{lookupErr: errors.New("connection refused")}
+
+	in := &fakeIn{invoice: node.Invoice{State: node.InvoiceAccepted}}
+	never := &Swap{Hash: swapHash, State: swap.Aborting, NoPayAttempt: true,
+		Created: measured}
+	d, _ := recorded(t, in, down, never)
+	if err := d.Do(ctx, never, swap.CancelIncoming); err != nil {
+		t.Fatalf("the cancel waited for the paying node: %v", err)
+	}
+	if in.cancelled != 1 {
+		t.Errorf("cancelled %d times, want once", in.cancelled)
+	}
+	in.invoice.State = node.InvoiceCancelled
+	ev, ok, err := d.Resume(ctx, never)
+	if err != nil || !ok || ev != swap.IncomingCancelled {
+		t.Errorf("resuming it: %v %v %v, want incoming cancelled", ev, ok,
+			err)
+	}
+
+	maybe := &Swap{Hash: swapHash, State: swap.Aborting, Created: measured}
+	in = &fakeIn{invoice: node.Invoice{State: node.InvoiceAccepted}}
+	d, _ = recorded(t, in, down, maybe)
+	if err := d.Do(ctx, maybe, swap.CancelIncoming); !errors.Is(err,
+		ErrStillPaying) || in.cancelled != 0 {
+
+		t.Errorf("one that may have paid was cancelled: %v, %d", err,
+			in.cancelled)
+	}
+}
+
+// TestRecordingPayingClearsNoPayAttempt: the write that records Paying is the
+// one that says a payment may now exist, so no crash after it can leave a
+// record claiming none was attempted.
+func TestRecordingPayingClearsNoPayAttempt(t *testing.T) {
+	ctx := context.Background()
+	sw := &Swap{Hash: swapHash, State: swap.Funded, NoPayAttempt: true,
+		Created: measured}
+	d, st := recorded(t, &fakeIn{}, &fakeOut{}, sw)
+
+	if _, err := d.Apply(ctx, sw, swap.MarginPassed); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Get(ctx, swapHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != swap.Paying || got.NoPayAttempt || sw.NoPayAttempt {
+		t.Errorf("recorded %v with no pay attempt %v (memory %v)",
+			got.State, got.NoPayAttempt, sw.NoPayAttempt)
+	}
+
+	// And a payment the node never received leaves it cleared: it is
+	// funded again, and may yet have reached the node after all.
+	if _, err := d.Apply(ctx, sw, swap.OutgoingNotSent); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.Get(ctx, swapHash); got.NoPayAttempt {
+		t.Error("funded again, it claims no payment was attempted")
+	}
+}

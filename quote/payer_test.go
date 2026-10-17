@@ -441,6 +441,11 @@ func TestParticipantsAreRecorded(t *testing.T) {
 	if rec.Participant != "alice" {
 		t.Errorf("participant %q, want alice", rec.Participant)
 	}
+	// And that nothing has been paid for it, so a refund before it is
+	// ever paid need not ask the paying node.
+	if !rec.NoPayAttempt {
+		t.Error("a new swap does not say no payment was attempted")
+	}
 }
 
 // limited is a quoter over many distinct invoices with the given limits.

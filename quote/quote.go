@@ -855,6 +855,7 @@ func (q *Quoter) create(ctx context.Context, terms *Quote, who string,
 		Created:           now,
 		Updated:           now,
 		Participant:       who,
+		NoPayAttempt:      true,
 	}
 	if err := q.Store.Put(ctx, rec); err != nil {
 		return fmt.Errorf("recording the quote: %w", err)

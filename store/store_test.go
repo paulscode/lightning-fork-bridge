@@ -1236,3 +1236,48 @@ func TestCommittedCountsTheRoutingBudget(t *testing.T) {
 		t.Errorf("want ErrRecord, got %v", err)
 	}
 }
+
+// TestNoPayAttemptSurvivesTheJournal: a swap that has never recorded Paying
+// says so across a restart, and a record that does not say, one written
+// before the flag existed, reads as one that may have paid.
+func TestNoPayAttemptSurvivesTheJournal(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "swaps.journal")
+
+	j := open(t, path)
+	never := rec(1, swap.Aborting)
+	never.NoPayAttempt = true
+	maybe := rec(2, swap.Aborting)
+	for _, r := range []Record{never, maybe} {
+		if err := j.Put(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := bytes.Count(raw, []byte(`"no_pay_attempt":true`)); n != 1 {
+		t.Errorf("the flag is written %d times, want once", n)
+	}
+
+	j = open(t, path)
+	defer j.Close()
+	for _, c := range []struct {
+		r    Record
+		want bool
+	}{{never, true}, {maybe, false}} {
+		got, err := j.Get(ctx, c.r.Hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.NoPayAttempt != c.want {
+			t.Errorf("%x: no pay attempt %v after a reopen, want %v",
+				c.r.Hash[:2], got.NoPayAttempt, c.want)
+		}
+	}
+}
