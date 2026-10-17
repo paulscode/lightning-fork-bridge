@@ -84,6 +84,10 @@ type Runner struct {
 	// price cannot be read, which waits, like a chain that cannot be
 	// measured, and past the funded grace the swap is given back.
 	//
+	// Its context ends when the outgoing invoice is down to GateReserve,
+	// and a check still running then gives the payer's funds back: an
+	// implementation that waits on the network should honour it.
+	//
 	// The quote fixed what the payer owes, and a payer may fund it minutes
 	// later. On a market that moves a few percent in that time the bridge
 	// would otherwise pay out at a loss whenever the move went against it.
@@ -545,16 +549,22 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 			errNotReady, err)
 
 	case expiry.IsZero():
-		log.Info("gated", "decision", "outgoing invoice expires too soon")
-		action, err := r.apply(ctx, sw, swap.MarginRefused, log)
-		if err != nil {
-			return false, err
-		}
-
-		return true, r.carryOut(ctx, sw, action, log)
+		return true, r.tooLate(ctx, sw, log)
 	}
 
-	rates, err := r.Rates(ctx)
+	// Everything else the gate asks is asked within the time the invoice
+	// has before its reserve, so that a slow route lookup or price source
+	// cannot start a payout with less than GateReserve left. A call cut
+	// off by that, rather than by the caller, means the invoice ran out
+	// while the gate was asking, and the swap is given back (lapsed).
+	pre, cancel := context.WithTimeout(ctx,
+		expiry.Sub(r.now())-r.gateReserve())
+	defer cancel()
+
+	rates, err := r.Rates(pre)
+	if r.lapsed(ctx, pre, err, expiry) {
+		return true, r.tooLate(ctx, sw, log)
+	}
 	if err != nil {
 		// No usable measurement is a reason to wait, not to pay and not to
 		// cancel: the HTLC is still claimable and the margin may well hold
@@ -563,7 +573,10 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 	}
 
 	if r.PriceCheck != nil {
-		ok, err := r.PriceCheck(ctx, sw)
+		ok, err := r.PriceCheck(pre, sw)
+		if r.lapsed(ctx, pre, err, expiry) {
+			return true, r.tooLate(ctx, sw, log)
+		}
 		if err != nil {
 			// Waiting, not refusing: a price source that failed to
 			// answer says nothing about this swap, and the funded
@@ -589,11 +602,21 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 	// up, and a payment sent then fails at once for want of a route, which
 	// gives the payer's funds back for a swap that a few seconds later
 	// would have paid. No route is a reason to wait, not to fail.
-	if err := r.routable(ctx, sw); err != nil {
+	err = r.routable(pre, sw)
+	if r.lapsed(ctx, pre, err, expiry) {
+		return true, r.tooLate(ctx, sw, log)
+	}
+	if err != nil {
 		return false, err
 	}
 
-	event, err := r.Driver.Gate(ctx, sw, rates)
+	// Looked at again after each call, and last after the margin, just
+	// before Paying is recorded: a call that answered may still have
+	// taken the invoice under its reserve.
+	event, err := r.Driver.Gate(pre, sw, rates)
+	if r.lapsed(ctx, pre, err, expiry) {
+		return true, r.tooLate(ctx, sw, log)
+	}
 	if err != nil {
 		// Gate returns MarginRefused alongside its errors, but acting on a
 		// refusal the bridge could not actually compute would cancel a
@@ -618,6 +641,38 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 	}
 
 	return true, nil
+}
+
+// tooLate gives a funded swap back because its outgoing invoice has less than
+// GateReserve left.
+func (r *Runner) tooLate(ctx context.Context, sw *driver.Swap,
+	log *slog.Logger) error {
+
+	log.Info("gated", "decision", "outgoing invoice expires too soon")
+	action, err := r.apply(ctx, sw, swap.MarginRefused, log)
+	if err != nil {
+		return err
+	}
+
+	return r.carryOut(ctx, sw, action, log)
+}
+
+// lapsed reports whether the outgoing invoice, expiring at expiry, has run
+// under GateReserve while the gate was asking: by the clock, or because pre,
+// the gate's context bounded by that, ended under a call that failed (err)
+// while the caller's ctx did not. A failure the caller's own ending explains
+// is not this: the runner is stopping, and the swap is left as it is.
+func (r *Runner) lapsed(ctx, pre context.Context, err error,
+	expiry time.Time) bool {
+
+	if ctx.Err() != nil {
+		return false
+	}
+	if expiry.Sub(r.now()) < r.gateReserve() {
+		return true
+	}
+
+	return err != nil && pre.Err() != nil
 }
 
 // ExpirySlack is how long past the outgoing invoice's expiry a payment attempt

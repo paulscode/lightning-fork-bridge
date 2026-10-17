@@ -42,6 +42,11 @@ type fakeIn struct {
 	mu        sync.Mutex
 	invoice   node.Invoice
 	lookupErr error
+	lookups   int
+
+	// onLookup, when set, is called with each lookup's count, before it
+	// answers, and its error returned instead.
+	onLookup  func(ctx context.Context, n int) error
 	height    int32
 	settled   int
 	cancelled int
@@ -66,8 +71,18 @@ func (f *fakeIn) AddHoldInvoice(context.Context, node.HoldInvoice) (string,
 	return "lnblakert1fake", nil
 }
 
-func (f *fakeIn) LookupInvoice(context.Context, node.Hash) (node.Invoice,
-	error) {
+func (f *fakeIn) LookupInvoice(ctx context.Context, _ node.Hash) (
+	node.Invoice, error) {
+
+	f.mu.Lock()
+	f.lookups++
+	n, on := f.lookups, f.onLookup
+	f.mu.Unlock()
+	if on != nil {
+		if err := on(ctx, n); err != nil {
+			return node.Invoice{}, err
+		}
+	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1703,6 +1718,204 @@ func (r *routedOut) Decode(ctx context.Context, inv string) (node.Decoded,
 	}
 
 	return r.fakeOut.Decode(ctx, inv)
+}
+
+// TestASlowGateStartsNoLatePayout: everything the gate asks after the first
+// look at the outgoing invoice can take time, and a payout must not start with
+// less than GateReserve left because of it. A route lookup or price check
+// that answers late is caught by a second look before Paying is recorded, and
+// one that would wait longer than the invoice has is cut off when it runs
+// under its reserve; either way the swap is given back, unpaid.
+func TestASlowGateStartsNoLatePayout(t *testing.T) {
+	const slow = 8 * time.Second
+
+	for _, c := range []struct {
+		name string
+		left time.Duration
+
+		// routeTakes, priceTakes and gateTakes (the incoming node, for
+		// the margin) move the clock by that much, or with hang wait for
+		// their context to end.
+		routeTakes, priceTakes, gateTakes time.Duration
+		hang                              bool
+		want                              swap.State
+	}{
+		{name: "a quick gate", left: 6 * time.Second,
+			want: swap.Settled},
+		{name: "a route answering late", left: 6 * time.Second,
+			routeTakes: slow, want: swap.Aborted},
+		{name: "a price answering late", left: 6 * time.Second,
+			priceTakes: slow, want: swap.Aborted},
+		{name: "a margin answering late", left: 6 * time.Second,
+			gateTakes: slow, want: swap.Aborted},
+		{name: "a margin that hangs",
+			left: DefaultGateReserve + 200*time.Millisecond,
+			hang: true, gateTakes: slow, want: swap.Aborted},
+		{name: "a route lookup that hangs",
+			left: DefaultGateReserve + 200*time.Millisecond,
+			hang: true, routeTakes: slow, want: swap.Aborted},
+		{name: "a price check that hangs",
+			left: DefaultGateReserve + 200*time.Millisecond,
+			hang: true, priceTakes: slow, want: swap.Aborted},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := deadline(t)
+			defer cancel()
+
+			var clockNanos atomic.Int64
+			clockNanos.Store(now.UnixNano())
+			moving := func() time.Time {
+				return time.Unix(0, clockNanos.Load()).UTC()
+			}
+			take := func(ctx context.Context, d time.Duration) error {
+				if d == 0 {
+					return nil
+				}
+				if c.hang {
+					<-ctx.Done()
+
+					return ctx.Err()
+				}
+				clockNanos.Add(int64(d))
+
+				return nil
+			}
+
+			in := &fakeIn{
+				invoice: node.Invoice{State: node.InvoiceAccepted,
+					ExpiryHeight: 1000},
+				height: 500,
+			}
+			out := &routedOut{fakeOut: &fakeOut{payment: node.Payment{
+				State: node.PaymentSucceeded, Preimage: preimage,
+			}, expiry: now.Add(c.left)}}
+			r, st := build(t, in, out.fakeOut, record(swap.Funded))
+			r.Driver.Out = out
+			r.Now, r.Driver.Now = moving, moving
+			out.hang = func(int) bool { return false }
+			out.route = func(int) error { return nil }
+			if c.routeTakes > 0 {
+				r.Driver.Out = &slowRoutes{routedOut: out,
+					take: func(ctx context.Context) error {
+						return take(ctx, c.routeTakes)
+					}}
+			}
+			if c.gateTakes > 0 {
+				// The first lookup is the swap being resumed; the
+				// second is the margin's, in Driver.Gate.
+				in.onLookup = func(ctx context.Context, n int) error {
+					if n != 2 {
+						return nil
+					}
+
+					return take(ctx, c.gateTakes)
+				}
+			}
+			r.PriceCheck = func(ctx context.Context, _ *driver.Swap) (
+				bool, error) {
+
+				if err := take(ctx, c.priceTakes); err != nil {
+					return false, err
+				}
+
+				return true, nil
+			}
+
+			start := time.Now()
+			if err := r.Drive(ctx, hash); err != nil {
+				t.Fatal(err)
+			}
+
+			final, _ := st.Get(context.Background(), hash)
+			if final.State != c.want {
+				t.Fatalf("ended in %v, want %v", final.State, c.want)
+			}
+			paid := atomic.LoadInt32(&out.paid)
+			_, cancelled := in.counts()
+			if c.want == swap.Aborted && (paid != 0 || cancelled != 1) {
+				t.Errorf("paid %d times and cancelled %d, want no "+
+					"payment and one cancel", paid, cancelled)
+			}
+			if took := time.Since(start); took > 5*time.Second {
+				t.Errorf("took %v; the invoice had %v", took, c.left)
+			}
+		})
+	}
+}
+
+// TestARunnerStoppedMidGateGivesNothingBack: a gate call cut off because the
+// runner is stopping, not because the invoice ran out, leaves the swap funded
+// for the next run, rather than reading as a lapsed invoice and refunding.
+func TestARunnerStoppedMidGateGivesNothingBack(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &routedOut{fakeOut: &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}}, route: func(int) error { return nil },
+		hang: func(int) bool { return true }}
+	r, st := build(t, in, out.fakeOut, record(swap.Funded))
+	r.Driver.Out = out
+
+	time.AfterFunc(50*time.Millisecond, cancel)
+	if err := r.Drive(ctx, hash); !errors.Is(err, context.Canceled) {
+		t.Fatalf("want the runner's cancellation, got %v", err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Funded {
+		t.Errorf("left in %v, want funded", final.State)
+	}
+	if _, cancelled := in.counts(); cancelled != 0 {
+		t.Errorf("cancelled %d times while stopping", cancelled)
+	}
+}
+
+// TestLapsedIsNotTheRunnerStopping: lapsed reads a gate call cut off with the
+// gate's own context as the invoice running out, but not when the runner's
+// context ended first; and the clock alone decides once a call answered.
+func TestLapsedIsNotTheRunnerStopping(t *testing.T) {
+	r := &Runner{Now: clock}
+	cut := errors.New("cut off")
+	expiry := now.Add(time.Hour)
+
+	live := context.Background()
+	ended, end := context.WithCancel(live)
+	end()
+
+	if r.lapsed(ended, ended, cut, expiry) {
+		t.Error("a stopping runner read as a lapsed invoice")
+	}
+	if !r.lapsed(live, ended, cut, expiry) {
+		t.Error("a call cut off by the invoice's time did not lapse")
+	}
+	if r.lapsed(live, ended, nil, expiry) {
+		t.Error("a call that answered in time lapsed")
+	}
+	if !r.lapsed(live, live, nil, now.Add(DefaultGateReserve-1)) {
+		t.Error("an invoice under its reserve did not lapse")
+	}
+}
+
+// slowRoutes is a routedOut whose route lookups take time first.
+type slowRoutes struct {
+	*routedOut
+
+	take func(context.Context) error
+}
+
+func (s *slowRoutes) FindRoute(ctx context.Context, inv string, fee uint64,
+	cltv uint32) (node.Route, error) {
+
+	if err := s.take(ctx); err != nil {
+		return node.Route{}, err
+	}
+
+	return s.routedOut.FindRoute(ctx, inv, fee, cltv)
 }
 
 // TestTheGateWaitsForARouteBeforePaying: a paying node just restarted answers
