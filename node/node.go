@@ -33,6 +33,16 @@ import (
 // but adapters must not lean on that.
 var ErrNotSent = errors.New("the payment never reached the paying node")
 
+// ErrContradiction is returned by an adapter when a node reports something
+// that cannot be true, such as a succeeded payment with no usable preimage.
+//
+// It is not a payment state and must not be translated into one: the bridge
+// waits rather than picking one of two readings of an incoherent answer. It is
+// not fatal either, since the node may answer coherently next time, but a
+// swap that keeps meeting it is one an operator has to look at, and the
+// runner raises it after a few attempts (runner.ContradictionAlertAfter).
+var ErrContradiction = errors.New("node reported an impossible payment")
+
 // ErrUnknownHash is returned when a node has no record of a payment hash.
 var ErrUnknownHash = errors.New("node has no record of this payment hash")
 

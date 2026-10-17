@@ -108,6 +108,13 @@ type Runner struct {
 	// Log receives what happened. Nil means discard.
 	Log *slog.Logger
 
+	// Alert, when set, is told about a swap that needs an operator's
+	// attention while it is still being driven: one whose paying node has
+	// contradicted itself ContradictionAlertAfter times in a row. why is
+	// the note recorded on the swap. It is called once per run of
+	// contradictions, from the swap's own goroutine, and must not block.
+	Alert func(hash node.Hash, why string)
+
 	mu     sync.Mutex
 	active map[node.Hash]struct{}
 }
@@ -232,7 +239,7 @@ func (r *Runner) Drive(ctx context.Context, hash node.Hash) error {
 	ticker := time.NewTicker(r.poll())
 	defer ticker.Stop()
 
-	var failures int
+	var failures, contradictions int
 	for {
 		if sw.State.Terminal() {
 			log.Info("finished", "state", sw.State.String())
@@ -241,6 +248,15 @@ func (r *Runner) Drive(ctx context.Context, hash node.Hash) error {
 		}
 
 		moved, err := r.step(ctx, &sw, log)
+		if errors.Is(err, node.ErrContradiction) {
+			contradictions++
+			if contradictions == ContradictionAlertAfter {
+				r.alert(ctx, &sw, contradictions, err, log)
+			}
+		} else {
+			contradictions = 0
+		}
+
 		switch {
 		case err == nil:
 			failures = 0
@@ -379,6 +395,43 @@ func (r *Runner) step(ctx context.Context, sw *driver.Swap,
 // loudAfter is how many consecutive transient failures pass before the log
 // stops treating them as noise.
 const loudAfter = 30
+
+// ContradictionAlertAfter is how many times in a row a swap may meet a node
+// contradicting itself (node.ErrContradiction) before the runner raises it to
+// the operator. Below it the answer may be a node mid-restart; at it, the node
+// keeps saying something impossible about a payment the swap depends on, and
+// retrying alone will not settle that.
+const ContradictionAlertAfter = 10
+
+// alert raises a swap to the operator while it keeps being driven: it records
+// why in the swap's note, where the journal and anything reading it keep it,
+// logs it, and tells Alert.
+//
+// Not a stop. A contradiction says nothing certain about the payment, so the
+// swap is neither failed nor paid on the strength of it, and the next coherent
+// answer from the node moves it on as usual.
+func (r *Runner) alert(ctx context.Context, sw *driver.Swap, n int, err error,
+	log *slog.Logger) {
+
+	why := fmt.Sprintf("needs an operator: the paying node contradicted "+
+		"itself %d times in a row about this swap's payment, and the "+
+		"bridge keeps retrying: %v", n, err)
+	log.Error("swap needs an operator", "state", sw.State.String(),
+		"why", why)
+
+	note := *sw
+	note.Note = why
+	note.Updated = r.now()
+	if perr := r.Store.Put(ctx, note); perr != nil {
+		log.Error("could not record the note", "err", perr)
+	} else {
+		*sw = note
+	}
+
+	if r.Alert != nil {
+		r.Alert(sw.Hash, why)
+	}
+}
 
 // fatal reports whether an error means this swap must stop being driven.
 //

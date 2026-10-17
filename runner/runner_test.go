@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -137,6 +138,9 @@ type fakeOut struct {
 	// expiry is when the outgoing invoice stops being payable. Zero means
 	// a day after the test clock's now.
 	expiry time.Time
+
+	// lookupErr, when set, is what LookupPayment returns.
+	lookupErr error
 }
 
 func (f *fakeOut) Pay(ctx context.Context, _ node.PayRequest) (node.Payment,
@@ -167,6 +171,9 @@ func (f *fakeOut) LookupPayment(_ context.Context, hash node.Hash) (
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.lookupErr != nil {
+		return node.Payment{}, f.lookupErr
+	}
 	if p, ok := f.lookups[hash]; ok {
 		return p, nil
 	}
@@ -1222,5 +1229,56 @@ func TestACancelAsksThePayingNodeFirst(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestANodeThatKeepsContradictingItselfIsRaised: a paying node that reports a
+// succeeded payment with no usable preimage is not answered by failing or
+// paying the swap, and it is not fatal either, since the next answer may make
+// sense. But one that keeps saying it is an operator's problem, and after
+// ContradictionAlertAfter attempts in a row the swap carries a note saying so
+// and Alert is told, once, while the runner keeps retrying.
+func TestANodeThatKeepsContradictingItselfIsRaised(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(),
+		300*time.Millisecond)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &fakeOut{lookupErr: fmt.Errorf("%w: succeeded but returned no "+
+		"preimage", node.ErrContradiction)}
+	r, st := build(t, in, out, record(swap.Paying))
+
+	var mu sync.Mutex
+	var alerts []string
+	r.Alert = func(h node.Hash, why string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if h != hash {
+			t.Errorf("alert for %x", h)
+		}
+		alerts = append(alerts, why)
+	}
+
+	if err := r.Drive(ctx, hash); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want the context to be what stopped it, got %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 {
+		t.Fatalf("alerted %d times, want once", len(alerts))
+	}
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Paying {
+		t.Errorf("it moved to %v on a contradiction", final.State)
+	}
+	if final.Note != alerts[0] || !strings.Contains(final.Note, "operator") {
+		t.Errorf("the record's note is %q", final.Note)
+	}
+	if _, cancelled := in.counts(); cancelled != 0 {
+		t.Error("it cancelled on a contradiction")
 	}
 }

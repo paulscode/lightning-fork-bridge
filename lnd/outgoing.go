@@ -19,9 +19,11 @@ import (
 
 // ErrNodeContradiction is returned when a node reports something that cannot
 // be true, such as a succeeded payment with no preimage. It is deliberately
-// not translated into a payment state: the bridge should stop rather than pick
-// one of two readings when the node's own answer is incoherent.
-var ErrNodeContradiction = errors.New("node reported an impossible payment")
+// not translated into a payment state: the bridge should wait rather than pick
+// one of two readings when the node's own answer is incoherent. It is
+// node.ErrContradiction, which the runner raises to the operator when a swap
+// keeps meeting it.
+var ErrNodeContradiction = node.ErrContradiction
 
 // Outgoing drives the node the bridge pays on.
 type Outgoing struct {
