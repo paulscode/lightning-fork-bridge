@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/paulscode/lightning-fork-bridge/margin"
 )
 
 // good is a configuration that loads, so each test can break exactly one
@@ -325,5 +327,51 @@ func TestConfigCatchesIncoherentPairs(t *testing.T) {
 				t.Errorf("the error should say %q, said: %v", test.want, err)
 			}
 		})
+	}
+}
+
+// TestTheHoldExpiryDeltaDefaultsAndIsChecked: a configuration that leaves the
+// margin's hold expiry delta out runs on lnd's default, starting from
+// margin.DefaultPolicy, and one that sets it under the default is refused.
+// Zero would count the blocks the incoming node has already given up in as
+// margin.
+func TestTheHoldExpiryDeltaDefaultsAndIsChecked(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := load(t, good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Margin.HoldExpiryDelta != margin.DefaultHoldExpiryDelta {
+		t.Errorf("hold expiry delta %d, want %d when not set",
+			cfg.Margin.HoldExpiryDelta, margin.DefaultHoldExpiryDelta)
+	}
+	if cfg.Margin.Settlement != 30*time.Minute {
+		t.Errorf("the configured settlement became %v",
+			cfg.Margin.Settlement)
+	}
+
+	for _, delta := range []string{"0", "17"} {
+		_, err := load(t, strings.Replace(good, `"MaxIncomingBlocks": 2016}`,
+			`"MaxIncomingBlocks": 2016, "HoldExpiryDelta": `+delta+`}`, 1))
+		if !errors.Is(err, ErrConfig) {
+			t.Errorf("a hold expiry delta of %s: want ErrConfig, got %v",
+				delta, err)
+		}
+	}
+}
+
+// TestTheExampleConfigurationLoads: config.example.json is what an operator
+// starts from, and one that the daemon refuses teaches the wrong numbers.
+func TestTheExampleConfigurationLoads(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := LoadFile(filepath.Join("..", "config.example.json"))
+	if err != nil {
+		t.Fatalf("config.example.json does not load: %v", err)
+	}
+	if cfg.Margin.HoldExpiryDelta != margin.DefaultHoldExpiryDelta {
+		t.Errorf("the example's hold expiry delta is %d",
+			cfg.Margin.HoldExpiryDelta)
 	}
 }

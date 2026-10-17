@@ -25,7 +25,8 @@ var (
 
 	blake = margin.Bounds{Fast: 155 * time.Second, Slow: 1200 * time.Second}
 	btc   = margin.Bounds{Fast: 300 * time.Second, Slow: 600 * time.Second}
-	marg  = margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016}
+	marg  = margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016,
+		HoldExpiryDelta: margin.DefaultHoldExpiryDelta}
 )
 
 // fakeIn records what the bridge asked for.

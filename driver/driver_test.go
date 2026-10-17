@@ -101,7 +101,8 @@ var (
 	btc      = margin.Bounds{Fast: 300 * time.Second, Slow: 600 * time.Second}
 	measured = time.Unix(1_700_000_000, 0)
 	rates    = Rates{Incoming: blake, Outgoing: btc, As: measured}
-	pol      = margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016}
+	pol      = margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016,
+		HoldExpiryDelta: margin.DefaultHoldExpiryDelta}
 )
 
 func fixedNow() time.Time { return measured.Add(time.Second) }
@@ -701,12 +702,14 @@ func TestGateDoesNotCountTheHoldExpiryDelta(t *testing.T) {
 	withDelta := pol
 	withDelta.HoldExpiryDelta = margin.DefaultHoldExpiryDelta
 
-	required, err := margin.RequiredIncomingBlocks(blake, margin.Leg{
+	withRequired, err := margin.RequiredIncomingBlocks(blake, margin.Leg{
 		Bounds: btc, Blocks: funded().OutgoingCLTVLimit,
-	}, pol)
+	}, withDelta)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// What the margin alone needs, the quote's ask less the delta.
+	required := withRequired - margin.DefaultHoldExpiryDelta
 
 	for _, tc := range []struct {
 		left int32
@@ -739,15 +742,17 @@ func TestGateDoesNotCountTheHoldExpiryDelta(t *testing.T) {
 		}
 	}
 
-	// And the quote asks the payer for exactly that much more.
-	withRequired, err := margin.RequiredIncomingBlocks(blake, margin.Leg{
-		Bounds: btc, Blocks: funded().OutgoingCLTVLimit,
-	}, withDelta)
-	if err != nil {
-		t.Fatal(err)
+	// And the quote asks the payer for exactly that much more than the
+	// margin alone needs: those blocks pass the check, one fewer does not.
+	out := margin.Leg{Bounds: btc, Blocks: funded().OutgoingCLTVLimit}
+	if err := margin.Check(margin.Leg{Bounds: blake, Blocks: required}, out,
+		withDelta); err != nil {
+
+		t.Errorf("%d blocks above the delta should pass: %v", required, err)
 	}
-	if withRequired != required+margin.DefaultHoldExpiryDelta {
-		t.Errorf("required %d with the delta, want %d", withRequired,
-			required+margin.DefaultHoldExpiryDelta)
+	if err := margin.Check(margin.Leg{Bounds: blake, Blocks: required - 1},
+		out, withDelta); err == nil {
+
+		t.Errorf("%d blocks above the delta should not pass", required-1)
 	}
 }

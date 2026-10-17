@@ -384,7 +384,8 @@ func TestMarginPolicyIsCarriedIntoBothDirections(t *testing.T) {
 
 	// A margin policy that reached one direction and not the other would
 	// size half the swaps against nothing.
-	cfg := margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016}
+	cfg := margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016,
+		HoldExpiryDelta: margin.DefaultHoldExpiryDelta}
 	s := &Service{cfg: Config{Margin: cfg}, log: quiet()}
 	if s.cfg.Margin != cfg {
 		t.Fatal("the margin policy did not survive being stored")

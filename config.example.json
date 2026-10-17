@@ -31,7 +31,8 @@
   },
   "margin": {
     "Settlement": 1800000000000,
-    "MaxIncomingBlocks": 2016
+    "MaxIncomingBlocks": 2016,
+    "HoldExpiryDelta": 18
   },
   "rate": {
     "maxAge": 300000000000,

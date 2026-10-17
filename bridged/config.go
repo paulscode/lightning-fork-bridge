@@ -184,8 +184,13 @@ func (s RateSource) valid() error {
 // Load reads a configuration and checks it. Unknown fields are an error: a
 // misspelled policy key that is silently ignored leaves the daemon running on
 // a default the operator thought they had overridden.
+//
+// The margin policy starts from margin.DefaultPolicy, so a configuration that
+// leaves a margin field out runs on the package's default rather than on zero.
+// HoldExpiryDelta is the one that matters: zero would count the blocks the
+// incoming node has already given up in as margin, and the policy refuses it.
 func Load(r io.Reader) (Config, error) {
-	var c Config
+	c := Config{Margin: margin.DefaultPolicy}
 
 	dec := json.NewDecoder(r)
 	dec.DisallowUnknownFields()
@@ -237,7 +242,11 @@ func (c Config) Valid() error {
 			"not usable", ErrConfig)
 	}
 	if !c.Margin.Valid() {
-		return fmt.Errorf("%w: the margin policy is not usable", ErrConfig)
+		return fmt.Errorf("%w: the margin policy is not usable (a hold "+
+			"expiry delta of %d blocks must be at least lnd's default of "+
+			"%d and under maxIncomingBlocks %d)", ErrConfig,
+			c.Margin.HoldExpiryDelta, margin.DefaultHoldExpiryDelta,
+			c.Margin.MaxIncomingBlocks)
 	}
 	if !c.Rate.Valid() {
 		return fmt.Errorf("%w: the rate policy is not usable", ErrConfig)

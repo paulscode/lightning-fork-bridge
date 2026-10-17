@@ -97,7 +97,8 @@ func quotableService(t *testing.T) *Service {
 			return 10_000_000_000, nil
 		},
 	}
-	marg := margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016}
+	marg := margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016,
+		HoldExpiryDelta: margin.DefaultHoldExpiryDelta}
 	sd.quoter = &quote.Quoter{
 		In: sd.in, Out: sd.out, Store: j,
 		Price:   s.pricer(sd, inventory.DefaultPolicy, sd.balance),

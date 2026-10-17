@@ -112,9 +112,15 @@ var DefaultPolicy = Policy{
 }
 
 // Valid reports whether the policy is usable.
+//
+// A HoldExpiryDelta under lnd's default is refused. No lnd gives up on a held
+// invoice later than that by default, and a smaller number, zero above all,
+// which is what a policy that never set it holds, would count the blocks the
+// node has already given up in as margin.
 func (p Policy) Valid() bool {
 	return p.Settlement >= 0 && p.MaxIncomingBlocks > 0 &&
 		p.MaxIncomingBlocks <= MaxBlocks &&
+		p.HoldExpiryDelta >= DefaultHoldExpiryDelta &&
 		p.HoldExpiryDelta < p.MaxIncomingBlocks
 }
 

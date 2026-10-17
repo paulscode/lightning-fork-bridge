@@ -341,7 +341,8 @@ func TestLiveRefund(t *testing.T) {
 // bounds are the mainnet-shaped numbers from S11: a regtest where blocks are
 // mined on demand has no spacing to measure, and bounds that reflected that
 // would wave every swap through the check this exists to make.
-var labMargin = margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016}
+var labMargin = margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016,
+	HoldExpiryDelta: margin.DefaultHoldExpiryDelta}
 
 // labRate is what a BTCB2 was worth in BTC when the venue was measured. The
 // lab has no market, so the number comes from the design's measurement rather

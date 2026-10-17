@@ -20,7 +20,8 @@ var (
 // TestWorkedExamples pins the numbers published in the design document. If
 // these move, the document is wrong and has to move with them.
 func TestWorkedExamples(t *testing.T) {
-	p := Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016}
+	p := Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016,
+		HoldExpiryDelta: DefaultHoldExpiryDelta}
 
 	cases := []struct {
 		outBlocks uint32
@@ -47,9 +48,12 @@ func TestWorkedExamples(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%d blocks: %v", c.outBlocks, err)
 		}
-		if got != c.want {
+		// The published numbers are the margin alone. The quote asks
+		// for lnd's hold expiry delta on top, since the incoming node
+		// gives up on a held invoice that many blocks before it expires.
+		if want := c.want + DefaultHoldExpiryDelta; got != want {
 			t.Errorf("%d BTC blocks: need %d BLAKE2b blocks, want %d",
-				c.outBlocks, got, c.want)
+				c.outBlocks, got, want)
 		}
 	}
 }
@@ -97,7 +101,8 @@ func TestBlocksAreNotDurations(t *testing.T) {
 // returns must pass, and one block fewer must fail. This is the invariant that
 // catches an off-by-one in either function, in whichever direction.
 func TestRequiredIsMinimal(t *testing.T) {
-	p := Policy{Settlement: 37 * time.Minute, MaxIncomingBlocks: MaxBlocks}
+	p := Policy{Settlement: 37 * time.Minute, MaxIncomingBlocks: MaxBlocks,
+		HoldExpiryDelta: DefaultHoldExpiryDelta}
 
 	// Spacings chosen to make the division land exactly, just over and just
 	// under, since that is where a rounding error hides.
@@ -119,13 +124,17 @@ func TestRequiredIsMinimal(t *testing.T) {
 					t.Fatalf("in %v out %v %d blocks: %v",
 						inFast, outSlow, outBlocks, err)
 				}
+				// Check counts what is left above the hold expiry
+				// delta, which the requirement adds on top.
+				if need <= p.HoldExpiryDelta {
+					t.Fatalf("in %v out %v %d blocks: required %d, "+
+						"no more than the delta", inFast, outSlow,
+						outBlocks, need)
+				}
+				need -= p.HoldExpiryDelta
 				if err := Check(Leg{Bounds: in, Blocks: need}, out, p); err != nil {
 					t.Fatalf("in %v out %v %d blocks: %d should pass: %v",
 						inFast, outSlow, outBlocks, need, err)
-				}
-				if need == 0 {
-					t.Fatalf("in %v out %v %d blocks: required 0",
-						inFast, outSlow, outBlocks)
 				}
 				err = Check(Leg{Bounds: in, Blocks: need - 1}, out, p)
 				if !errors.Is(err, ErrUnsafe) {
@@ -202,7 +211,8 @@ func TestMonotonic(t *testing.T) {
 // TestCheckIsStrict makes sure a leg that merely ties with the exposure is
 // refused. Equality leaves no time at all to claim.
 func TestCheckIsStrict(t *testing.T) {
-	p := Policy{Settlement: 0, MaxIncomingBlocks: 2016}
+	p := Policy{Settlement: 0, MaxIncomingBlocks: 2016,
+		HoldExpiryDelta: DefaultHoldExpiryDelta}
 	in := Leg{Bounds: Bounds{Fast: time.Minute, Slow: time.Minute}, Blocks: 10}
 	out := Leg{Bounds: Bounds{Fast: time.Minute, Slow: time.Minute}, Blocks: 10}
 
@@ -275,10 +285,27 @@ func TestRejectsBadInput(t *testing.T) {
 		p:    Policy{Settlement: time.Hour},
 		want: ErrBounds,
 	}, {
+		// Under lnd's default, and above all zero, which a policy that
+		// never set it holds: the blocks the incoming node has already
+		// given up in would count as margin.
+		name: "hold expiry delta under lnd's default",
+		in:   ok,
+		out:  ok,
+		p: Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016,
+			HoldExpiryDelta: DefaultHoldExpiryDelta - 1},
+		want: ErrBounds,
+	}, {
+		name: "no hold expiry delta",
+		in:   ok,
+		out:  ok,
+		p:    Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016},
+		want: ErrBounds,
+	}, {
 		name: "negative settlement",
 		in:   ok,
 		out:  ok,
-		p:    Policy{Settlement: -time.Hour, MaxIncomingBlocks: 100},
+		p: Policy{Settlement: -time.Hour, MaxIncomingBlocks: 100,
+			HoldExpiryDelta: DefaultHoldExpiryDelta},
 		want: ErrBounds,
 	}}
 
@@ -302,7 +329,8 @@ func TestRejectsBadInput(t *testing.T) {
 // TestRefusesRatherThanQuoteAbsurdly checks that a swap needing more CLTV than
 // anyone would route is declined, not quoted.
 func TestRefusesRatherThanQuoteAbsurdly(t *testing.T) {
-	p := Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016}
+	p := Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016,
+		HoldExpiryDelta: DefaultHoldExpiryDelta}
 
 	// A very fast incoming chain against a long outgoing leg.
 	fast := Bounds{Fast: time.Second, Slow: time.Minute}
@@ -380,6 +408,7 @@ func FuzzCheck(f *testing.F) {
 		p := Policy{
 			Settlement:        time.Duration(settleSec) * time.Second,
 			MaxIncomingBlocks: MaxBlocks,
+			HoldExpiryDelta:   DefaultHoldExpiryDelta,
 		}
 
 		err := Check(in, out, p)
@@ -403,9 +432,11 @@ func FuzzCheck(f *testing.F) {
 			t.Fatalf("Check passed but no requirement could be computed: %v",
 				err)
 		}
-		if need > in.Blocks {
+		// The requirement asks for the hold expiry delta on top of
+		// what Check counts.
+		if need-p.HoldExpiryDelta > in.Blocks {
 			t.Fatalf("Check passed at %d blocks but %d are required",
-				in.Blocks, need)
+				in.Blocks, need-p.HoldExpiryDelta)
 		}
 	})
 }
@@ -417,7 +448,8 @@ func TestSettlementAdditionCannotWrap(t *testing.T) {
 	// One block at very nearly the maximum representable spacing.
 	huge := time.Duration(math.MaxInt64 - 1000)
 	out := Leg{Bounds: Bounds{Fast: huge, Slow: huge}, Blocks: 1}
-	p := Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016}
+	p := Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016,
+		HoldExpiryDelta: DefaultHoldExpiryDelta}
 
 	if _, err := OutgoingExposure(out, p); !errors.Is(err, ErrBounds) {
 		t.Fatalf("want ErrBounds, got %v", err)
@@ -434,7 +466,10 @@ func TestSettlementAdditionCannotWrap(t *testing.T) {
 // RequiredIncomingBlocks, and shows it shrinking when the incoming chain runs
 // faster.
 func TestMaxOutgoingBlocksIsTheLargestThatFits(t *testing.T) {
-	p := Policy{Settlement: time.Hour, MaxIncomingBlocks: 1776}
+	// 1776 blocks of margin, and the hold expiry delta on top.
+	p := Policy{Settlement: time.Hour,
+		MaxIncomingBlocks: 1776 + DefaultHoldExpiryDelta,
+		HoldExpiryDelta:   DefaultHoldExpiryDelta}
 	in := Bounds{Fast: 200 * time.Second, Slow: 40 * time.Minute}
 	out := Bounds{Fast: 5 * time.Minute, Slow: 15 * time.Minute}
 
@@ -460,7 +495,8 @@ func TestMaxOutgoingBlocksIsTheLargestThatFits(t *testing.T) {
 	}
 
 	// Nothing fits when the settlement alone does not.
-	tight := Policy{Settlement: 1000 * time.Hour, MaxIncomingBlocks: 10}
+	tight := Policy{Settlement: 1000 * time.Hour, MaxIncomingBlocks: 100,
+		HoldExpiryDelta: DefaultHoldExpiryDelta}
 	if m, _ := MaxOutgoingBlocks(in, out, tight); m != 0 {
 		t.Errorf("%d fit under an impossible policy", m)
 	}

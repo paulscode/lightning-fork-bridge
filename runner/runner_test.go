@@ -19,8 +19,9 @@ import (
 var (
 	blake = margin.Bounds{Fast: 155 * time.Second, Slow: 1200 * time.Second}
 	btc   = margin.Bounds{Fast: 300 * time.Second, Slow: 600 * time.Second}
-	pol   = margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016}
-	now   = time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	pol   = margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016,
+		HoldExpiryDelta: margin.DefaultHoldExpiryDelta}
+	now = time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
 
 	preimage = node.Preimage{0xab, 0xcd}
 	hash     = preimage.Hash()
