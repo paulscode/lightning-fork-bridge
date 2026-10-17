@@ -293,7 +293,7 @@ func (r *Runner) Drive(ctx context.Context, hash node.Hash) error {
 		// for nothing; a few seconds is nothing against an HTLC's
 		// deadline, and the gate still decides every attempt.
 		wait := ticker.C
-		if errors.Is(err, errNotSent) {
+		if errors.Is(err, errNotSent) || errors.Is(err, errNotReady) {
 			wait = time.After(r.notSentPause())
 		}
 		select {
@@ -508,8 +508,10 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 	if ok, err := r.payable(ctx, sw); err != nil {
 		// Waiting, as for the price: a node that could not read the
 		// invoice says nothing about it, and the funded grace gives the
-		// swap back if it never can.
-		return false, fmt.Errorf("reading the outgoing invoice: %w", err)
+		// swap back if it never can. At the not-sent pace: a node that
+		// cannot decode is usually one restarting.
+		return false, fmt.Errorf("%w: reading the outgoing invoice: %w",
+			errNotReady, err)
 	} else if !ok {
 		log.Info("gated", "decision", "outgoing invoice expires too soon")
 		action, err := r.apply(ctx, sw, swap.MarginRefused, log)
@@ -528,6 +530,17 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 		return false, fmt.Errorf("gate: %w", err)
 	}
 	log.Info("gated", "decision", event.String())
+
+	// The last check before Paying is recorded: the paying node has a route
+	// now. A node that has just restarted answers RPCs before its channels
+	// are up, and a payment sent then fails at once for want of a route,
+	// which gives the payer's funds back for a swap that a few seconds
+	// later would have paid. No route is a reason to wait, not to fail.
+	if event == swap.MarginPassed {
+		if err := r.routable(ctx, sw); err != nil {
+			return false, err
+		}
+	}
 
 	action, err := r.apply(ctx, sw, event, log)
 	if err != nil {
@@ -571,6 +584,30 @@ func (r *Runner) payable(ctx context.Context, sw *driver.Swap) (bool, error) {
 
 	return dec.Expiry.Sub(r.now()) >= r.payTimeout()+ExpirySlack, nil
 }
+
+// routable asks the paying node, when it can be asked, for a route within the
+// swap's routing budget and CLTV limit: the same question the quote asked.
+// Any failure, no route included, is errNotReady, which waits at the not-sent
+// pace; the funded grace gives the swap back if a route never appears.
+func (r *Runner) routable(ctx context.Context, sw *driver.Swap) error {
+	finder, ok := r.Driver.Out.(node.RouteFinder)
+	if !ok {
+		return nil
+	}
+	if _, err := finder.FindRoute(ctx, sw.Invoice, sw.MaxFeeMsat,
+		sw.OutgoingCLTVLimit); err != nil {
+
+		return fmt.Errorf("%w: no route to pay on yet: %w", errNotReady,
+			err)
+	}
+
+	return nil
+}
+
+// errNotReady is why a funded swap waits at the gate for something the paying
+// node cannot do yet: read the invoice, or route to it. Transient, retried
+// after NotSentPause, like a payment the node did not receive.
+var errNotReady = errors.New("the paying node is not ready to pay")
 
 // pay sends the outgoing leg. By the time it is called the record already says
 // the swap is paying, which is what makes a crash here recoverable.

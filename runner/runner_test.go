@@ -1381,3 +1381,195 @@ func TestARestartResumesAPayingSwapFromTheJournalOnDisk(t *testing.T) {
 		})
 	}
 }
+
+// routedOut is a paying node that can be asked for a route, as both of the
+// fork's are. route answers each FindRoute; payable is set once one has
+// succeeded, and a payment before that is the failure under test.
+type routedOut struct {
+	*fakeOut
+
+	mu      sync.Mutex
+	route   func(n int) error
+	asked   int
+	routed  bool
+	early   int
+	decodes int32
+	decode  error
+}
+
+func (r *routedOut) FindRoute(context.Context, string, uint64, uint32) (
+	node.Route, error) {
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.asked++
+	if err := r.route(r.asked); err != nil {
+		return node.Route{}, err
+	}
+	r.routed = true
+
+	return node.Route{CLTV: 40, FeeMsat: 10}, nil
+}
+
+func (r *routedOut) Pay(ctx context.Context, req node.PayRequest) (
+	node.Payment, error) {
+
+	r.mu.Lock()
+	if !r.routed {
+		r.early++
+	}
+	r.mu.Unlock()
+
+	return r.fakeOut.Pay(ctx, req)
+}
+
+func (r *routedOut) Decode(ctx context.Context, inv string) (node.Decoded,
+	error) {
+
+	atomic.AddInt32(&r.decodes, 1)
+	if r.decode != nil {
+		return node.Decoded{}, r.decode
+	}
+
+	return r.fakeOut.Decode(ctx, inv)
+}
+
+// TestTheGateWaitsForARouteBeforePaying: a paying node just restarted answers
+// RPCs before its channels are up, and a payment sent then fails at once for
+// want of a route, refunding a swap that would have paid seconds later. The
+// gate asks for a route just before paying and waits while there is none, at
+// the not-sent pace, and pays once one appears.
+func TestTheGateWaitsForARouteBeforePaying(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &routedOut{fakeOut: &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}}, route: func(n int) error {
+		if n <= 3 {
+			return fmt.Errorf("%w: channel link not found", node.ErrNoRoute)
+		}
+
+		return nil
+	}}
+	r, st := build(t, in, out.fakeOut, record(swap.Funded))
+	r.Driver.Out = out
+	r.NotSentPause = 20 * time.Millisecond
+
+	start := time.Now()
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Settled {
+		t.Fatalf("ended in %v", final.State)
+	}
+	if out.early != 0 {
+		t.Errorf("paid %d times before there was a route", out.early)
+	}
+	if n := atomic.LoadInt32(&out.paid); n != 1 {
+		t.Errorf("paid %d times, want once", n)
+	}
+	if _, cancelled := in.counts(); cancelled != 0 {
+		t.Error("the payer's HTLC was given back while waiting for a route")
+	}
+	// Three waits at the pause, not at the poll.
+	if took := time.Since(start); took < 3*r.NotSentPause {
+		t.Errorf("waited %v for three missing routes", took)
+	}
+}
+
+// TestARouteThatNeverAppearsIsGivenBackAtTheEndOfTheGrace: waiting for a route
+// is bounded by the funded grace, like any other wait at the gate, and then
+// the payer's funds go back with nothing paid.
+func TestARouteThatNeverAppearsIsGivenBackAtTheEndOfTheGrace(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	var mu sync.Mutex
+	at := now
+	tick := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return at
+	}
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &routedOut{fakeOut: &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}}, route: func(int) error {
+		// Each attempt takes four minutes of the clock.
+		mu.Lock()
+		at = at.Add(4 * time.Minute)
+		mu.Unlock()
+
+		return node.ErrNoRoute
+	}}
+	r, st := build(t, in, out.fakeOut, record(swap.Funded))
+	r.Driver.Out = out
+	r.Driver.Now = tick
+	r.Now = tick
+	r.Rates = func(context.Context) (driver.Rates, error) {
+		return driver.Rates{Incoming: blake, Outgoing: btc, As: tick()}, nil
+	}
+	r.NotSentPause = time.Millisecond
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Aborted {
+		t.Fatalf("ended in %v, want aborted", final.State)
+	}
+	if n := atomic.LoadInt32(&out.paid); n != 0 {
+		t.Errorf("paid %d times with no route", n)
+	}
+	if _, cancelled := in.counts(); cancelled != 1 {
+		t.Errorf("cancelled %d times", cancelled)
+	}
+	if !tick().After(now.Add(time.Minute + DefaultFundedGrace)) {
+		t.Errorf("given back at %v, before the grace ran out", tick())
+	}
+}
+
+// TestAnUnreadableInvoiceIsRetriedAtTheNotSentPace: a node that cannot decode
+// is usually restarting, and asking it every poll is the pace that caught it
+// with its RPCs up and its channels not.
+func TestAnUnreadableInvoiceIsRetriedAtTheNotSentPace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(),
+		300*time.Millisecond)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &routedOut{fakeOut: &fakeOut{}, route: func(int) error {
+		return nil
+	}, decode: errors.New("the RPC server is in the process of starting up")}
+	r, _ := build(t, in, out.fakeOut, record(swap.Funded))
+	r.Driver.Out = out
+	r.NotSentPause = 50 * time.Millisecond
+
+	if err := r.Drive(ctx, hash); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want the context to stop it, got %v", err)
+	}
+	// 300 ms at a 50 ms pause is about six tries; at the 1 ms poll it would
+	// be hundreds.
+	if n := atomic.LoadInt32(&out.decodes); n > 10 || n < 2 {
+		t.Errorf("decoded %d times in 300 ms at a 50 ms pause", n)
+	}
+	if n := atomic.LoadInt32(&out.paid); n != 0 {
+		t.Errorf("paid %d times", n)
+	}
+}
