@@ -541,7 +541,18 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 		return Quote{}, err
 	}
 
-	reading, err := q.Price(ctx)
+	// The price, the chains and the route are asked within the time the
+	// invoice has before it is down to MinRemainingLife: past that it is
+	// refused as expires_soon however they answer (see reserve), so a slow
+	// one is cut off there and the invoice refused as such.
+	asking, cancel := context.WithTimeout(ctx,
+		dec.Expiry.Sub(now)-q.Policy.MinRemainingLife)
+	defer cancel()
+
+	reading, err := q.Price(asking)
+	if err := q.late(ctx, asking, dec, err); err != nil {
+		return Quote{}, err
+	}
 	if err != nil {
 		return Quote{}, fmt.Errorf("%w: %w", ErrRefused, err)
 	}
@@ -552,7 +563,10 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 	}
 	terms.Outgoing = invoice
 
-	spacing, err := q.Spacing(ctx)
+	spacing, err := q.Spacing(asking)
+	if err := q.late(ctx, asking, dec, err); err != nil {
+		return Quote{}, err
+	}
 	if err != nil {
 		return Quote{}, fmt.Errorf("%w: %w", ErrRefused, err)
 	}
@@ -599,8 +613,11 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 	if finder, ok := q.Out.(node.RouteFinder); ok {
 		// Within the budget less the padding the payment will add,
 		// which the budget check above leaves room for.
-		route, err := finder.FindRoute(ctx, invoice, terms.MaxFeeMsat,
-			budget-BlockPadding)
+		route, err := finder.FindRoute(asking, invoice,
+			terms.MaxFeeMsat, budget-BlockPadding)
+		if err := q.late(ctx, asking, dec, err); err != nil {
+			return Quote{}, err
+		}
 		switch {
 		case errors.Is(err, node.ErrNoRoute):
 			return Quote{}, fmt.Errorf("%w: %w: within %d msat of fees "+
@@ -627,10 +644,8 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 			ErrRefused, err)
 	}
 	terms.CLTVDelta = blocks
-	validity, holdExpiry := q.lives(dec, now)
-	terms.Expires = now.Add(validity)
 
-	rec, err := q.reserve(ctx, terms, who, now, forget)
+	rec, holdExpiry, err := q.reserve(ctx, &terms, dec, who, forget)
 	if err != nil {
 		return Quote{}, err
 	}
@@ -642,11 +657,11 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 }
 
 // lives is how long a quote on an invoice is valid for, and how long its hold
-// invoice lives: the policy's, or what is left of the invoice less
+// invoice lives, from now: the policy's, or what is left of the invoice less
 // QuoteReserve when that is shorter, so that neither outlasts what the bridge
 // can still deliver. In whole seconds, as a hold invoice's expiry is, so the
-// quote and the invoice carrying it end together. checkInvoice has refused an
-// invoice with less than MinRemainingLife left, so both are at least
+// quote and the invoice carrying it end together. reserve has refused an
+// invoice with less than MinRemainingLife left at now, so both are at least
 // MinValidity.
 func (q *Quoter) lives(dec node.Decoded, now time.Time) (time.Duration,
 	time.Duration) {
@@ -693,19 +708,34 @@ func (q *Quoter) fits(ctx context.Context, amountMsat uint64) error {
 // said yes, so that a refused quote leaves it where it was. Forgetting it
 // first and then refusing would be harmless, since it was cancelled, but it
 // would erase what an operator might want to look at.
-func (q *Quoter) reserve(ctx context.Context, terms Quote, who string,
-	now time.Time, forget bool) (store.Record, error) {
+func (q *Quoter) reserve(ctx context.Context, terms *Quote, dec node.Decoded,
+	who string, forget bool) (store.Record, time.Duration, error) {
 
 	q.roomMu.Lock()
 	defer q.roomMu.Unlock()
 
 	if err := q.fits(ctx, terms.OutgoingMsat); err != nil {
-		return store.Record{}, err
+		return store.Record{}, 0, err
 	}
+
+	// The quote's life is counted from here, not from when it was asked
+	// for: the price, the chains and the route have taken their time since,
+	// and the node counts the hold invoice's expiry from when it creates
+	// it, a moment after this. An invoice that has run under
+	// MinRemainingLife meanwhile is refused as it would have been asked
+	// now, rather than quoted for less than a quote at the floor gets, or
+	// for a time already past.
+	now := q.now()
+	if err := q.expiresSoon(dec, now); err != nil {
+		return store.Record{}, 0, err
+	}
+	validity, hold := q.lives(dec, now)
+	terms.Expires = now.Add(validity)
+
 	if forget {
 		if err := q.In.ForgetInvoice(ctx, terms.Hash); err != nil {
-			return store.Record{}, fmt.Errorf("clearing the previous "+
-				"attempt's cancelled invoice: %w", err)
+			return store.Record{}, 0, fmt.Errorf("clearing the "+
+				"previous attempt's cancelled invoice: %w", err)
 		}
 	}
 
@@ -727,10 +757,11 @@ func (q *Quoter) reserve(ctx context.Context, terms Quote, who string,
 		NoInvoice:         true,
 	}
 	if err := q.Store.Put(ctx, rec); err != nil {
-		return store.Record{}, fmt.Errorf("recording the quote: %w", err)
+		return store.Record{}, 0, fmt.Errorf("recording the quote: %w",
+			err)
 	}
 
-	return rec, nil
+	return rec, hold, nil
 }
 
 // previous decides what an earlier swap for the same payment hash means for a
@@ -871,15 +902,8 @@ func (q *Quoter) checkInvoice(dec node.Decoded, now time.Time) error {
 		// the permissive reading of a malformed invoice.
 		return fmt.Errorf("%w: the invoice has no readable expiry", ErrRefused)
 	}
-	if dec.Expiry.Sub(now) < q.Policy.MinRemainingLife {
-		// Quoting against an invoice about to expire sells something the
-		// bridge may not be able to deliver: the payer funds the incoming
-		// leg and the outgoing one can no longer be paid. The payout then
-		// fails and the payer is refunded, so this is about the payer's
-		// time, not their money.
-		return fmt.Errorf("%w: %w: the invoice has %v left, less than the "+
-			"%v a quote needs", ErrRefused, ErrExpiresSoon,
-			dec.Expiry.Sub(now).Round(time.Second), q.Policy.MinRemainingLife)
+	if err := q.expiresSoon(dec, now); err != nil {
+		return err
 	}
 	padded := uint64(dec.CLTVDelta) + BlockPadding
 	if padded >= uint64(q.Policy.OutgoingCLTVLimit) {
@@ -893,6 +917,38 @@ func (q *Quoter) checkInvoice(dec node.Decoded, now time.Time) error {
 	}
 
 	return nil
+}
+
+// expiresSoon refuses an invoice with less than MinRemainingLife left at now.
+//
+// Quoting against an invoice about to expire sells something the bridge may
+// not be able to deliver: the payer funds the incoming leg and the outgoing
+// one can no longer be paid. The payout then fails and the payer is refunded,
+// so this is about the payer's time, not their money.
+func (q *Quoter) expiresSoon(dec node.Decoded, now time.Time) error {
+	if left := dec.Expiry.Sub(now); left < q.Policy.MinRemainingLife {
+		return fmt.Errorf("%w: %w: the invoice has %v left, less than the "+
+			"%v a quote needs", ErrRefused, ErrExpiresSoon,
+			left.Round(time.Second), q.Policy.MinRemainingLife)
+	}
+
+	return nil
+}
+
+// late reports, as expires_soon, a call that failed (err) because asking, the
+// quote's context bounded by the invoice's MinRemainingLife, ended while the
+// caller's ctx did not; and nil for any other outcome, which the caller reads
+// as before.
+func (q *Quoter) late(ctx, asking context.Context, dec node.Decoded,
+	err error) error {
+
+	if err == nil || asking.Err() == nil || ctx.Err() != nil {
+		return nil
+	}
+
+	return fmt.Errorf("%w: %w: the invoice ran under the %v a quote needs "+
+		"while the bridge was working it out: %v", ErrRefused,
+		ErrExpiresSoon, q.Policy.MinRemainingLife, err)
 }
 
 // price works out what the payer owes.

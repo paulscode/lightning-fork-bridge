@@ -866,11 +866,19 @@ type routedOut struct {
 	maxFee uint64
 	cltv   uint32
 	asked  int
+
+	// take, when set, runs first, and its error is returned instead.
+	take func(context.Context) error
 }
 
-func (r *routedOut) FindRoute(_ context.Context, _ string, maxFeeMsat uint64,
+func (r *routedOut) FindRoute(ctx context.Context, _ string, maxFeeMsat uint64,
 	cltvLimit uint32) (node.Route, error) {
 
+	if r.take != nil {
+		if err := r.take(ctx); err != nil {
+			return node.Route{}, err
+		}
+	}
 	r.asked++
 	r.maxFee, r.cltv = maxFeeMsat, cltvLimit
 
@@ -885,6 +893,125 @@ func buildRouted(t *testing.T, in *fakeIn, out *routedOut,
 	q.Out = out
 
 	return q, st
+}
+
+// TestASlowQuoteIsCountedFromWhenItIsMade: the price and the route take time,
+// and the node counts the hold invoice's expiry from when it creates it, so a
+// quote's life is counted from just before the swap is recorded, not from when
+// it was asked for. An invoice that has run under MinRemainingLife meanwhile is
+// refused as expires_soon with nothing created or recorded, rather than quoted
+// with an expires_at already past and a hold invoice outliving the invoice. A
+// call that would wait past that point is cut off there.
+func TestASlowQuoteIsCountedFromWhenItIsMade(t *testing.T) {
+	const slow = 12 * time.Second
+
+	for _, c := range []struct {
+		name string
+		left time.Duration
+
+		// routeTakes and priceTakes move the clock by that much, or with
+		// hang wait for their context to end.
+		routeTakes, priceTakes time.Duration
+		hang                   bool
+
+		// validity is the quote's life from when it is made, zero for
+		// a refusal.
+		validity time.Duration
+	}{
+		{name: "a slow route on 45 s", left: 45 * time.Second,
+			routeTakes: slow, validity: 23 * time.Second},
+		{name: "a slow price on 45 s", left: 45 * time.Second,
+			priceTakes: slow, validity: 23 * time.Second},
+		{name: "a slow route on 20 s", left: 20 * time.Second,
+			routeTakes: slow},
+		{name: "a slow price on 25 s", left: 25 * time.Second,
+			priceTakes: slow},
+		{name: "a route lookup that hangs",
+			left:       DefaultPolicy.MinRemainingLife + 200*time.Millisecond,
+			routeTakes: slow, hang: true},
+		{name: "a price that hangs",
+			left:       DefaultPolicy.MinRemainingLife + 200*time.Millisecond,
+			priceTakes: slow, hang: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(),
+				5*time.Second)
+			defer cancel()
+
+			var clockNanos atomic.Int64
+			clockNanos.Store(now.UnixNano())
+			moving := func() time.Time {
+				return time.Unix(0, clockNanos.Load()).UTC()
+			}
+			take := func(ctx context.Context, d time.Duration) error {
+				if d == 0 {
+					return nil
+				}
+				if c.hang {
+					<-ctx.Done()
+
+					return ctx.Err()
+				}
+				clockNanos.Add(int64(d))
+
+				return nil
+			}
+
+			dec := decoded()
+			dec.Expiry = now.Add(c.left)
+			in := &fakeIn{}
+			out := &routedOut{fakeOut: fakeOut{decoded: dec},
+				route: node.Route{CLTV: 100},
+				take: func(ctx context.Context) error {
+					return take(ctx, c.routeTakes)
+				}}
+			q, st := buildRouted(t, in, out, 0.015)
+			q.Now = moving
+			price := q.Price
+			q.Price = func(ctx context.Context) (rate.Reading, error) {
+				if err := take(ctx, c.priceTakes); err != nil {
+					return rate.Reading{}, err
+				}
+
+				return price(ctx)
+			}
+
+			got, err := q.Quote(ctx, "lnbc1x")
+			if c.validity == 0 {
+				if CodeOf(err) != CodeExpiresSoon {
+					t.Fatalf("want expires_soon, got %v", err)
+				}
+				if in.asked != nil {
+					t.Error("it created a hold invoice anyway")
+				}
+				if p, _ := st.Pending(ctx); len(p) != 0 {
+					t.Error("it recorded the swap anyway")
+				}
+
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			made := moving()
+			if want := made.Add(c.validity); !got.Expires.Equal(want) {
+				t.Errorf("expires %v after the quote was made, want %v",
+					got.Expires.Sub(made), c.validity)
+			}
+			if !got.Expires.Equal(dec.Expiry.Add(
+				-DefaultPolicy.QuoteReserve)) {
+
+				t.Errorf("expires %v before the invoice, want %v",
+					dec.Expiry.Sub(got.Expires),
+					DefaultPolicy.QuoteReserve)
+			}
+			if in.asked == nil || in.asked.Expiry != c.validity {
+				t.Errorf("the hold invoice was asked for %+v, want "+
+					"%v", in.asked, c.validity)
+			}
+		})
+	}
 }
 
 // TestNoRouteIsRefusedBeforeAnythingIsCreated: the payer is never held for a
