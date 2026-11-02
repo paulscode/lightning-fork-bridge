@@ -378,6 +378,46 @@ func TestAnUnfundedQuoteLapses(t *testing.T) {
 	}
 }
 
+// TestAQuoteWhoseInvoiceNeverExistedLapses: a quote recorded and then refused
+// by the incoming node's AddHoldInvoice has nothing on the node to read, and
+// still ends when its quote does rather than being looked up every poll.
+func TestAQuoteWhoseInvoiceNeverExistedLapses(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{lookupErr: fmt.Errorf("%w: %x", node.ErrUnknownHash,
+		hash), height: 500}
+	rec := record(swap.Quoted)
+	rec.NoInvoice, rec.NoPayAttempt = true, true
+	r, st := build(t, in, &fakeOut{}, rec)
+
+	// Each reading of the clock is ten seconds on, so the minute's quote
+	// runs out after a handful of polls.
+	var ticks atomic.Int64
+	moving := func() time.Time {
+		return now.Add(time.Duration(ticks.Add(1)) * 10 * time.Second)
+	}
+	r.Now, r.Driver.Now = moving, moving
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Expired {
+		t.Fatalf("ended in %v", final.State)
+	}
+	if _, cancelled := in.counts(); cancelled != 0 {
+		t.Errorf("cancelled %d times an invoice that never existed",
+			cancelled)
+	}
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if in.lookups > 10 {
+		t.Errorf("looked up %d times", in.lookups)
+	}
+}
+
 // TestAFundedSwapIsPaidWithinItsGrace: a swap funded before its quote
 // expired is still paid shortly after, because funding is what the quote
 // asked for and a node taking a few seconds to answer is not the payer's
