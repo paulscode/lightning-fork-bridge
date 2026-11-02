@@ -267,6 +267,50 @@ func TestTheIncomingCLTVComesFromBothChains(t *testing.T) {
 	}
 }
 
+// TestTheIncomingCLTVMeetsLndsMinimum. An incoming chain measured slower than
+// the whole outgoing exposure sizes the incoming leg at one block plus the
+// hold expiry delta, 19, and lnd refuses a hold invoice asking under 24.
+func TestTheIncomingCLTVMeetsLndsMinimum(t *testing.T) {
+	ctx := context.Background()
+
+	slow := margin.Bounds{Fast: 1000 * time.Hour, Slow: 1000 * time.Hour}
+	raw, err := margin.RequiredIncomingBlocks(slow, margin.Leg{
+		Bounds: btc, Blocks: DefaultPolicy.OutgoingCLTVLimit,
+	}, marg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw >= node.MinCLTVDelta {
+		t.Fatalf("the setup sizes %d blocks, not under lnd's minimum", raw)
+	}
+
+	in := &fakeIn{}
+	q, _ := build(t, in, &fakeOut{decoded: decoded()}, 0.01)
+	q.Spacing = func(context.Context) (driver.Rates, error) {
+		return driver.Rates{Incoming: slow, Outgoing: btc, As: now}, nil
+	}
+	got, err := q.Quote(ctx, "lnbc1x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CLTVDelta != node.MinCLTVDelta ||
+		in.asked.CLTVDelta != node.MinCLTVDelta {
+
+		t.Errorf("CLTV delta %d, hold invoice %d, want %d", got.CLTVDelta,
+			in.asked.CLTVDelta, node.MinCLTVDelta)
+	}
+
+	// A limit under the minimum refuses rather than asks for more.
+	q2, _ := build(t, &fakeIn{}, &fakeOut{decoded: decoded()}, 0.01)
+	q2.Spacing = q.Spacing
+	q2.Margin.MaxIncomingBlocks = node.MinCLTVDelta - 1
+	if _, err := q2.Quote(ctx, "lnbc1x"); !errors.Is(err, ErrRefused) ||
+		!errors.Is(err, margin.ErrTooLong) {
+
+		t.Errorf("under-minimum limit: %v", err)
+	}
+}
+
 // TestRoundingNeverFavoursThePayer. Half a millisatoshi is nothing once and a
 // systematic leak across every swap a bridge ever does, in a direction that
 // never corrects.

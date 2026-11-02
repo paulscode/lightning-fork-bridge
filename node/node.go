@@ -64,6 +64,11 @@ type Route struct {
 // limit pays within it only if it was asked for within the limit less this.
 const BlockPadding = 3
 
+// MinCLTVDelta is the smallest final CLTV delta lnd lets an invoice it
+// creates ask for (routing.MinCLTVDelta, 24 since lnd 0.21): AddHoldInvoice
+// refuses fewer. Both nodes a bridge holds invoices on are lnd.
+const MinCLTVDelta = 24
+
 // RouteFinder is an Outgoing node that can say, before anything is committed,
 // whether it has a route to an invoice's destination within a routing budget
 // and a CLTV limit. Optional: a quote asks one when the paying node is one,

@@ -643,6 +643,18 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 		return Quote{}, fmt.Errorf("%w: sizing the incoming CLTV: %w",
 			ErrRefused, err)
 	}
+	// The incoming node creates no invoice under lnd's minimum, which an
+	// incoming chain measured slow against a short exposure would ask for
+	// (one block plus the hold expiry delta, 19). More blocks only give the
+	// bridge longer to claim the incoming HTLC.
+	if blocks < node.MinCLTVDelta {
+		blocks = node.MinCLTVDelta
+	}
+	if blocks > q.Margin.MaxIncomingBlocks {
+		return Quote{}, fmt.Errorf("%w: %w: lnd's minimum of %d blocks "+
+			"exceeds the incoming limit of %d", ErrRefused,
+			margin.ErrTooLong, blocks, q.Margin.MaxIncomingBlocks)
+	}
 	terms.CLTVDelta = blocks
 
 	rec, holdExpiry, err := q.reserve(ctx, &terms, dec, who, forget)
