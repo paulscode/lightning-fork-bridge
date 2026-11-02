@@ -23,6 +23,7 @@ import (
 	"github.com/paulscode/lightning-fork-bridge/inventory"
 	"github.com/paulscode/lightning-fork-bridge/lnd"
 	"github.com/paulscode/lightning-fork-bridge/margin"
+	"github.com/paulscode/lightning-fork-bridge/node"
 	"github.com/paulscode/lightning-fork-bridge/quote"
 	"github.com/paulscode/lightning-fork-bridge/rate"
 	"github.com/paulscode/lightning-fork-bridge/runner"
@@ -466,6 +467,12 @@ func (c Config) Valid() error {
 			"%d and under maxIncomingBlocks %d)", ErrConfig,
 			c.Margin.HoldExpiryDelta, margin.DefaultHoldExpiryDelta,
 			c.Margin.MaxIncomingBlocks))
+	}
+	if c.Margin.MaxIncomingBlocks < node.MinCLTVDelta {
+		add(fmt.Errorf("%w: maxIncomingBlocks %d is under lnd's minimum "+
+			"invoice CLTV delta of %d, so every quote would be "+
+			"refused", ErrConfig, c.Margin.MaxIncomingBlocks,
+			node.MinCLTVDelta))
 	}
 	if !c.Rate.Valid() {
 		add(fmt.Errorf("%w: the rate policy is not usable", ErrConfig))

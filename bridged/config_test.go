@@ -469,6 +469,20 @@ func TestTheHoldExpiryDeltaDefaultsAndIsChecked(t *testing.T) {
 				delta, err)
 		}
 	}
+
+	// Under lnd's minimum invoice CLTV delta every quote is refused, though
+	// the margin policy alone allows it.
+	// (Both are refused here anyway, as too short for this configuration's
+	// swaps; only the first for that reason.)
+	for blocks, want := range map[string]bool{"23": true, "24": false} {
+		_, err := load(t, strings.Replace(good, `"MaxIncomingBlocks": 2016}`,
+			`"MaxIncomingBlocks": `+blocks+`}`, 1))
+		got := err != nil && strings.Contains(err.Error(),
+			"under lnd's minimum invoice CLTV delta")
+		if got != want {
+			t.Errorf("maxIncomingBlocks %s: got %v", blocks, err)
+		}
+	}
 }
 
 // TestTheExampleConfigurationLoads: config.example.json is what an operator
