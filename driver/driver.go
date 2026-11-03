@@ -306,14 +306,25 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 // is the only claim against it. Whether that claim is truly gone, or the node
 // is not the one that held it, is for an operator to establish.
 func (d *Driver) resumeForgotten(sw *Swap) (swap.Event, bool, error) {
-	if sw.State != swap.Quoted && sw.State != swap.Paid {
-		// Said, because the same answer from the wrong node would end the
-		// swap while the right one still holds an HTLC until its expiry.
+	switch sw.State {
+	case swap.Offered, swap.Funded:
+		// Warned, because the bridge never asked for this cancel, and the
+		// same answer from the wrong node would end the swap while the
+		// right one still holds an HTLC until its expiry.
 		d.log().Warn("the incoming node has no record of the hold "+
 			"invoice; ending the swap as given back, since a node "+
 			"deletes only a cancelled invoice. If the bridge is not "+
 			"connected to the node that issued it, an HTLC held there "+
 			"goes back to the payer only at its expiry",
+			"swap", fmt.Sprintf("%x", sw.Hash[:8]),
+			"state", sw.State.String())
+
+	case swap.Failing, swap.Aborting, swap.Expiring:
+		// The bridge's own cancel, deleted at once by a node that
+		// collects cancelled invoices: what every swap given back does
+		// there, so not a warning.
+		d.log().Info("the incoming node has no record of the hold "+
+			"invoice the bridge cancelled; taking it as given back",
 			"swap", fmt.Sprintf("%x", sw.Hash[:8]),
 			"state", sw.State.String())
 	}

@@ -205,7 +205,10 @@ Three things about the nodes and the host the daemon cannot check for itself:
   nothing to read, and the quote is refused as `funded_before`. Leave both
   off on the incoming nodes. A swap whose hold invoice is deleted this way
   still ends without paying out (an unpaid one as lapsed, one paid into as
-  given back), unless it had already paid out. That one is
+  given back). One the bridge had not cancelled itself is logged as a
+  warning, since a node that is not the one that issued the invoice gives
+  the same answer, and that node keeps the payer's HTLC until it expires.
+  A swap that had already paid out does not end. That one is
   logged as `swap did not finish` and left in the journal, since the deleted
   invoice was its only claim and only a person can rule out the bridge
   reading the wrong node; each restart drives it again and stops it again.

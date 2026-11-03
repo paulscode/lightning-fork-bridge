@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,20 +33,38 @@ var (
 	testHash     = node.Hash(sha256.Sum256(testPreimage[:]))
 )
 
-// fakeIn issues hold invoices and remembers what it was asked for.
+// fakeIn issues hold invoices and remembers what it was asked for. One it
+// issued stays open; the bridge's runner reads it in the background, and
+// takes a hash the node has no record of as an invoice deleted after a cancel.
 type fakeIn struct {
 	addErr error
+
+	mu     sync.Mutex
+	issued map[node.Hash]bool
 }
 
-func (f *fakeIn) AddHoldInvoice(context.Context, node.HoldInvoice) (string, error) {
+func (f *fakeIn) AddHoldInvoice(_ context.Context, req node.HoldInvoice) (string, error) {
 	if f.addErr != nil {
 		return "", f.addErr
 	}
 
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.issued == nil {
+		f.issued = make(map[node.Hash]bool)
+	}
+	f.issued[req.Hash] = true
+
 	return "lnblakert1holdinvoice", nil
 }
 
-func (f *fakeIn) LookupInvoice(context.Context, node.Hash) (node.Invoice, error) {
+func (f *fakeIn) LookupInvoice(_ context.Context, hash node.Hash) (node.Invoice, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.issued[hash] {
+		return node.Invoice{State: node.InvoiceOpen}, nil
+	}
+
 	return node.Invoice{}, node.ErrUnknownHash
 }
 func (f *fakeIn) SettleInvoice(context.Context, node.Preimage) error { return nil }
