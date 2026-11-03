@@ -204,7 +204,8 @@ Three things about the nodes and the host the daemon cannot check for itself:
   HTLCs it held, as a backstop to the journal; with it deleted that check has
   nothing to read, and the quote is refused as `funded_before`. Leave both
   off on the incoming nodes. A swap whose hold invoice is deleted this way
-  still ends, as given back, unless it had already paid out. That one is
+  still ends without paying out (an unpaid one as lapsed, one paid into as
+  given back), unless it had already paid out. That one is
   logged as `swap did not finish` and left in the journal, since the deleted
   invoice was its only claim and only a person can rule out the bridge
   reading the wrong node; each restart drives it again and stops it again.
