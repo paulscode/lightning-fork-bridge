@@ -221,12 +221,10 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 
 	// Everything else is decided by what the incoming node says.
 	inv, err := d.In.LookupInvoice(ctx, sw.Hash)
+	if errors.Is(err, node.ErrUnknownHash) {
+		return d.resumeForgotten(sw)
+	}
 	if err != nil {
-		if errors.Is(err, node.ErrUnknownHash) && sw.State == swap.Quoted {
-			// Nothing was ever created, which is consistent.
-			return 0, false, nil
-		}
-
 		return 0, false, fmt.Errorf("reading the incoming invoice: %w", err)
 	}
 	if inv.HTLCs > 0 {
@@ -277,6 +275,54 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 	// claimable while the bridge was down. Resuming one by reissuing
 	// something would be guessing at what Gate is there to work out.
 	return 0, false, nil
+}
+
+// resumeForgotten decides a swap whose hold invoice the incoming node has no
+// record of.
+//
+// Before the invoice is created that is consistent. After, the node has
+// deleted it, which lnd allows only for a cancelled invoice: by hand, or at
+// once with gc-canceled-invoices-on-the-fly. A cancelled invoice holds no
+// HTLC and cannot be paid again, so every state that has not paid out ends
+// as if the cancel had been seen; retrying the lookup would never get another
+// answer. If instead the bridge is reading the wrong node, ending these swaps
+// still pays nothing out, and the node that does hold an HTLC gives it back
+// at its own height expiry.
+//
+// Paid is the exception: the payout has gone and settling the incoming HTLC
+// is the only claim against it. Whether that claim is truly gone, or the node
+// is not the one that held it, is for an operator to establish.
+func (d *Driver) resumeForgotten(sw *Swap) (swap.Event, bool, error) {
+	switch sw.State {
+	case swap.Quoted:
+		// Nothing was ever created.
+		return 0, false, nil
+
+	case swap.Offered:
+		// Unpaid, and now unpayable.
+		return swap.IncomingLapsed, true, nil
+
+	case swap.Funded:
+		// As the gate refuses an incoming HTLC that is no longer
+		// claimable.
+		return swap.MarginRefused, true, nil
+
+	case swap.Failing, swap.Aborting, swap.Expiring:
+		// The cancel this state was waiting to see. The outgoing payment
+		// was checked above for the states that may have paid.
+		return swap.IncomingCancelled, true, nil
+
+	case swap.Paid:
+		return 0, false, fmt.Errorf("%w: paid out, but the incoming node "+
+			"has no record of the hold invoice, so the incoming HTLC "+
+			"cannot be settled. Check that the bridge is connected to "+
+			"the node that issued it and that its database was not "+
+			"restored from an older backup; if the invoice was cancelled "+
+			"and deleted, the payout is lost", ErrNeedsOperator)
+	}
+
+	return 0, false, fmt.Errorf("reading the incoming invoice: %w: %x",
+		node.ErrUnknownHash, sw.Hash)
 }
 
 // resumePaying is the delicate one. A swap was recorded as Paying, so an
@@ -361,7 +407,20 @@ func (d *Driver) Do(ctx context.Context, sw *Swap, a swap.Action) error {
 			return err
 		}
 
-		return d.In.CancelInvoice(ctx, sw.Hash)
+		err := d.In.CancelInvoice(ctx, sw.Hash)
+		if err == nil {
+			return nil
+		}
+
+		// An invoice the node has deleted holds nothing to give back;
+		// Resume ends the swap on the next look (resumeForgotten).
+		if _, lookupErr := d.In.LookupInvoice(ctx, sw.Hash); errors.Is(
+			lookupErr, node.ErrUnknownHash) {
+
+			return nil
+		}
+
+		return err
 
 	case swap.SettleIncoming:
 		// Only ever out of Paid, which is only reachable from Paying by the

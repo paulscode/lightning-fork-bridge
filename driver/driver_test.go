@@ -20,6 +20,8 @@ type fakeIn struct {
 	height    int32
 	heightErr error
 
+	cancelErr error
+
 	settled   int
 	cancelled int
 }
@@ -45,7 +47,7 @@ func (f *fakeIn) SettleInvoice(context.Context, node.Preimage) error {
 func (f *fakeIn) CancelInvoice(context.Context, node.Hash) error {
 	f.cancelled++
 
-	return nil
+	return f.cancelErr
 }
 
 func (f *fakeIn) ForgetInvoice(context.Context, node.Hash) error { return nil }
@@ -379,9 +381,70 @@ func TestResumeOtherStates(t *testing.T) {
 	if _, ok, err := d.Resume(ctx, &Swap{State: swap.Quoted}); ok || err != nil {
 		t.Errorf("quoted with no invoice: %v %v", ok, err)
 	}
-	// But an unknown hash for a swap that should have one is an error.
-	if _, _, err := d.Resume(ctx, &Swap{State: swap.Offered}); err == nil {
-		t.Error("an offered swap whose invoice the node does not know is a fault")
+}
+
+// TestResumeAnInvoiceTheNodeDeleted: lnd deletes only cancelled invoices, so
+// a swap that has not paid out ends; one that has is left to an operator.
+func TestResumeAnInvoiceTheNodeDeleted(t *testing.T) {
+	ctx := context.Background()
+	unknown := &fakeIn{lookupErr: node.ErrUnknownHash}
+
+	for _, tc := range []struct {
+		sw   Swap
+		pmt  node.Payment
+		want swap.Event
+		has  bool
+	}{
+		{Swap{State: swap.Offered}, node.Payment{}, swap.IncomingLapsed, true},
+		{Swap{State: swap.Funded}, node.Payment{}, swap.MarginRefused, true},
+		{Swap{State: swap.Failing}, node.Payment{State: node.PaymentFailed},
+			swap.IncomingCancelled, true},
+		{Swap{State: swap.Aborting, NoPayAttempt: true}, node.Payment{},
+			swap.IncomingCancelled, true},
+		{Swap{State: swap.Expiring}, node.Payment{}, swap.IncomingCancelled,
+			true},
+
+		// What the paying node says still comes first.
+		{Swap{State: swap.Failing}, node.Payment{State: node.PaymentSucceeded},
+			swap.OutgoingSucceeded, true},
+		{Swap{State: swap.Failing}, node.Payment{State: node.PaymentInFlight},
+			0, false},
+	} {
+		d := &Driver{In: unknown, Out: &fakeOut{lookup: tc.pmt}, Policy: pol}
+		sw := tc.sw
+		ev, ok, err := d.Resume(ctx, &sw)
+		if err != nil || ok != tc.has || ev != tc.want {
+			t.Errorf("%v (payment %v): got %v %v %v, want %v %v",
+				tc.sw.State, tc.pmt.State, ev, ok, err, tc.want, tc.has)
+		}
+	}
+
+	d := &Driver{In: unknown, Out: &fakeOut{}, Policy: pol}
+	_, ok, err := d.Resume(ctx, &Swap{State: swap.Paid})
+	if ok || !errors.Is(err, ErrNeedsOperator) {
+		t.Errorf("paid out with the invoice gone: %v %v, want "+
+			"ErrNeedsOperator", ok, err)
+	}
+}
+
+// TestCancellingADeletedInvoiceIsDone: there is nothing left to give back.
+func TestCancellingADeletedInvoiceIsDone(t *testing.T) {
+	ctx := context.Background()
+	sw := &Swap{State: swap.Expiring, NoPayAttempt: true}
+
+	gone := &fakeIn{lookupErr: node.ErrUnknownHash,
+		cancelErr: errors.New("unable to locate invoice")}
+	d := &Driver{In: gone, Out: &fakeOut{}, Policy: pol}
+	if err := d.Do(ctx, sw, swap.CancelIncoming); err != nil {
+		t.Errorf("cancelling a deleted invoice: %v", err)
+	}
+
+	// Any other refusal is still an error.
+	held := &fakeIn{invoice: node.Invoice{State: node.InvoiceAccepted},
+		cancelErr: errors.New("node unavailable")}
+	d = &Driver{In: held, Out: &fakeOut{}, Policy: pol}
+	if err := d.Do(ctx, sw, swap.CancelIncoming); err == nil {
+		t.Error("a cancel the node refused was taken as done")
 	}
 }
 

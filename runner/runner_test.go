@@ -50,6 +50,10 @@ type fakeIn struct {
 	height    int32
 	settled   int
 	cancelled int
+
+	// gc deletes an invoice as soon as it is cancelled, as lnd does with
+	// gc-canceled-invoices-on-the-fly.
+	gc bool
 }
 
 func (f *fakeIn) set(fn func(*fakeIn)) {
@@ -119,6 +123,9 @@ func (f *fakeIn) CancelInvoice(context.Context, node.Hash) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if errors.Is(f.lookupErr, node.ErrUnknownHash) {
+		return errors.New("unable to locate invoice")
+	}
 	if f.invoice.State == node.InvoiceCancelled {
 		return nil // idempotent
 	}
@@ -127,6 +134,9 @@ func (f *fakeIn) CancelInvoice(context.Context, node.Hash) error {
 	}
 	f.cancelled++
 	f.invoice.State = node.InvoiceCancelled
+	if f.gc {
+		f.lookupErr = node.ErrUnknownHash
+	}
 
 	return nil
 }
@@ -316,6 +326,54 @@ func TestAFailedOutgoingLegReturnsTheClaim(t *testing.T) {
 	settled, cancelled := in.counts()
 	if settled != 0 || cancelled != 1 {
 		t.Errorf("settled %d, cancelled %d", settled, cancelled)
+	}
+}
+
+// TestAFailedSwapEndsWhenTheNodeDeletesTheCancelledInvoice: an incoming node
+// that deletes cancelled invoices at once leaves nothing to read after the
+// cancel, which must still end the swap rather than retry forever.
+func TestAFailedSwapEndsWhenTheNodeDeletesTheCancelledInvoice(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+		gc:      true,
+	}
+	out := &fakeOut{payment: node.Payment{State: node.PaymentFailed}}
+	r, st := build(t, in, out, record(swap.Offered))
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Failed {
+		t.Fatalf("ended in %v", final.State)
+	}
+	settled, cancelled := in.counts()
+	if settled != 0 || cancelled != 1 {
+		t.Errorf("settled %d, cancelled %d", settled, cancelled)
+	}
+}
+
+// TestAnOfferedSwapWhoseInvoiceWasDeletedEnds: the node expired the unpaid
+// hold invoice and deleted it before the bridge looked again.
+func TestAnOfferedSwapWhoseInvoiceWasDeletedEnds(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{lookupErr: node.ErrUnknownHash, height: 500}
+	r, st := build(t, in, &fakeOut{}, record(swap.Offered))
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Expired {
+		t.Fatalf("ended in %v", final.State)
 	}
 }
 
