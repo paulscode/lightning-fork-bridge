@@ -211,11 +211,13 @@ Three things about the nodes and the host the daemon cannot check for itself:
   the payer's HTLC, so there the swap stops with `swap did not finish`, and
   is driven again after the daemon restarts pointed back at its issuer. A
   swap quoted before the key was recorded cannot be checked, and ends with a
-  warning in the log. A swap that had already paid out does not end. That one is
-  logged as `swap did not finish` and left in the journal, since the deleted
-  invoice was its only claim and only a person can rule out the bridge
-  reading the wrong node; each restart drives it again and stops it again.
-  This daemon has no command to decide it.
+  warning in the log. A swap that had already paid out does not end. That
+  one is logged as `swap did not finish` and left in the journal, since the
+  deleted invoice was its only claim and only a person can rule out a node
+  database restored from an older backup (and, for a swap quoted before the
+  key was recorded, the bridge reading the wrong node); each restart drives
+  it again and stops it again. This daemon has no command to decide either
+  kind of stopped swap; Lightning Fork's `lncli bridge resolve` does.
 
 ## Upgrading
 
@@ -231,7 +233,9 @@ on it again until they have finished, then fix the configuration.
 From v0.1.9 the journal records the identity key of the node that issued each
 swap's hold invoice (`incoming_node`), and a quote asks the incoming node for
 it before anything is created. Swaps already in the journal have none and are
-handled as before; an older binary reading the journal ignores the field. For
+handled as before. An older binary reading the journal ignores the field and
+drops it from any record it writes again, so a swap it touches loses the
+check after upgrading again. For
 Go code that implements `node.Incoming` itself, the interface gains
 `IdentityKey`, the node's compressed identity key in lower-case hex.
 
