@@ -377,6 +377,31 @@ func TestAnOfferedSwapWhoseInvoiceWasDeletedEnds(t *testing.T) {
 	}
 }
 
+// TestAPaidSwapWhoseInvoiceWasDeletedStopsForAnOperator: paid out, and the
+// node has no record of the hold invoice whose settling claims it back. The
+// bridge settles nothing and does not decide alone whether the claim is gone.
+func TestAPaidSwapWhoseInvoiceWasDeletedStopsForAnOperator(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{lookupErr: node.ErrUnknownHash, height: 500}
+	rec := record(swap.Paid)
+	rec.Preimage = preimage
+	r, st := build(t, in, &fakeOut{}, rec)
+
+	err := r.Drive(ctx, hash)
+	if !errors.Is(err, driver.ErrNeedsOperator) {
+		t.Fatalf("want ErrNeedsOperator, got %v", err)
+	}
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Paid {
+		t.Fatalf("ended in %v", final.State)
+	}
+	if settled, cancelled := in.counts(); settled != 0 || cancelled != 0 {
+		t.Errorf("settled %d, cancelled %d", settled, cancelled)
+	}
+}
+
 // TestAMarginThatDoesNotHoldAbortsBeforePaying. This is the abort-rather-than-
 // pay decision reaching all the way out to the nodes.
 func TestAMarginThatDoesNotHoldAbortsBeforePaying(t *testing.T) {

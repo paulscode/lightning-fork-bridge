@@ -409,6 +409,13 @@ func TestResumeAnInvoiceTheNodeDeleted(t *testing.T) {
 			swap.OutgoingSucceeded, true},
 		{Swap{State: swap.Failing}, node.Payment{State: node.PaymentInFlight},
 			0, false},
+		// An abort reached after a payment that may have left (sent back
+		// from Paying as never received) asks the paying node too.
+		{Swap{State: swap.Aborting}, node.Payment{State: node.PaymentInFlight},
+			0, false},
+		{Swap{State: swap.Aborting},
+			node.Payment{State: node.PaymentSucceeded},
+			swap.OutgoingSucceeded, true},
 	} {
 		d := &Driver{In: unknown, Out: &fakeOut{lookup: tc.pmt}, Policy: pol}
 		sw := tc.sw
@@ -445,6 +452,14 @@ func TestCancellingADeletedInvoiceIsDone(t *testing.T) {
 	d = &Driver{In: held, Out: &fakeOut{}, Policy: pol}
 	if err := d.Do(ctx, sw, swap.CancelIncoming); err == nil {
 		t.Error("a cancel the node refused was taken as done")
+	}
+
+	// So is a refusal followed by a lookup that says nothing.
+	down := &fakeIn{lookupErr: errors.New("connection refused"),
+		cancelErr: errors.New("connection refused")}
+	d = &Driver{In: down, Out: &fakeOut{}, Policy: pol}
+	if err := d.Do(ctx, sw, swap.CancelIncoming); err == nil {
+		t.Error("a cancel to an unreachable node was taken as done")
 	}
 }
 

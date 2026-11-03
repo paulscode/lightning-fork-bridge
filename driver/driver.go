@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/paulscode/lightning-fork-bridge/margin"
@@ -93,6 +94,18 @@ type Driver struct {
 
 	// Now is the clock, for tests. Zero means time.Now.
 	Now func() time.Time
+
+	// Log is where the driver says what it decided on its own. Nil means
+	// nowhere.
+	Log *slog.Logger
+}
+
+func (d *Driver) log() *slog.Logger {
+	if d.Log != nil {
+		return d.Log
+	}
+
+	return slog.New(slog.DiscardHandler)
 }
 
 func (d *Driver) now() time.Time {
@@ -293,6 +306,18 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 // is the only claim against it. Whether that claim is truly gone, or the node
 // is not the one that held it, is for an operator to establish.
 func (d *Driver) resumeForgotten(sw *Swap) (swap.Event, bool, error) {
+	if sw.State != swap.Quoted && sw.State != swap.Paid {
+		// Said, because the same answer from the wrong node would end the
+		// swap while the right one still holds an HTLC until its expiry.
+		d.log().Warn("the incoming node has no record of the hold "+
+			"invoice; ending the swap as given back, since a node "+
+			"deletes only a cancelled invoice. If the bridge is not "+
+			"connected to the node that issued it, an HTLC held there "+
+			"goes back to the payer only at its expiry",
+			"swap", fmt.Sprintf("%x", sw.Hash[:8]),
+			"state", sw.State.String())
+	}
+
 	switch sw.State {
 	case swap.Quoted:
 		// Nothing was ever created.

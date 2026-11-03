@@ -250,6 +250,7 @@ func (s *Service) build(name string, d Direction, inConn, outConn *grpc.ClientCo
 	sd.runner = &runner.Runner{
 		Driver: &driver.Driver{
 			In: sd.in, Out: sd.out, Store: s.journal, Policy: s.cfg.Margin,
+			Log: s.log.With("direction", name),
 		},
 		Store: s.journal, Rates: runner.Rates(s.spacing(invert)),
 		PriceCheck: s.priceCheck(sd),
