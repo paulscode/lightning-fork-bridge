@@ -16,8 +16,10 @@ package store
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/paulscode/lightning-fork-bridge/node"
@@ -150,6 +152,14 @@ type Record struct {
 	// having held, an HTLC for the hold invoice: the swap was funded, at
 	// least in part, whatever state it ended in. Once set it stays set.
 	HTLCSeen bool
+
+	// IncomingNode is the identity key of the incoming node that issued
+	// the hold invoice, compressed and hex-encoded, recorded with the quote
+	// before the invoice exists. The bridge ends a swap whose invoice the
+	// node has no record of only when the node it asks is this one: another
+	// node gives the same answer while the issuer may still hold the payer's
+	// HTLC. Empty in a record written before it existed.
+	IncomingNode string
 }
 
 // Valid reports whether a record can be stored. It is deliberately narrow:
@@ -191,6 +201,19 @@ func (r Record) Valid() error {
 
 	if _, err := swap.ParseBinding(r.Binding.String()); err != nil {
 		return fmt.Errorf("%w: %w", ErrRecord, err)
+	}
+
+	// A key that cannot match any node would make every check against it
+	// a mismatch, and stop the swap for an operator for nothing.
+	if r.IncomingNode != "" {
+		k, err := hex.DecodeString(r.IncomingNode)
+		if err != nil || len(k) != 33 ||
+			r.IncomingNode != strings.ToLower(r.IncomingNode) {
+
+			return fmt.Errorf("%w: incoming node %q is not a compressed "+
+				"public key in lower-case hex", ErrRecord,
+				r.IncomingNode)
+		}
 	}
 
 	switch r.Binding {

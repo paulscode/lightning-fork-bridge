@@ -245,6 +245,11 @@ func (i *Incoming) BlockHeight(ctx context.Context) (int32, error) {
 	return blockHeight(ctx, i.main)
 }
 
+// IdentityKey is the node's identity key, as GetInfo reports it.
+func (i *Incoming) IdentityKey(ctx context.Context) (string, error) {
+	return identityKey(ctx, i.main)
+}
+
 // Check confirms the node answers and is synced to its chain.
 //
 // Worth calling at startup. Dialling succeeds against a node that is not
@@ -277,6 +282,22 @@ func blockHeight(ctx context.Context, c lnrpc.LightningClient) (int32, error) {
 	}
 
 	return int32(h), nil
+}
+
+func identityKey(ctx context.Context, c lnrpc.LightningClient) (string,
+	error) {
+
+	info, err := c.GetInfo(ctx, &lnrpc.GetInfoRequest{})
+	if err != nil {
+		return "", fmt.Errorf("reading the node's identity: %w", err)
+	}
+	key := strings.ToLower(info.GetIdentityPubkey())
+	if k, err := hex.DecodeString(key); err != nil || len(k) != 33 {
+		return "", fmt.Errorf("the node gives %q as its identity key, "+
+			"which is not a compressed public key", key)
+	}
+
+	return key, nil
 }
 
 // invoiceAbsent reports whether a lookup failed because the node has no such

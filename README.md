@@ -205,10 +205,13 @@ Three things about the nodes and the host the daemon cannot check for itself:
   nothing to read, and the quote is refused as `funded_before`. Leave both
   off on the incoming nodes. A swap whose hold invoice is deleted this way
   still ends without paying out (an unpaid one as lapsed, one paid into as
-  given back). One the bridge had not cancelled itself is logged as a
-  warning, since a node that is not the one that issued the invoice gives
-  the same answer, and that node keeps the payer's HTLC until it expires.
-  A swap that had already paid out does not end. That one is
+  given back). Each swap records the identity key of the node that issued
+  its hold invoice, and ends this way only when the node it reads is that
+  one: another node gives the same answer while the issuer may still hold
+  the payer's HTLC, so there the swap stops with `swap did not finish`, and
+  is driven again after the daemon restarts pointed back at its issuer. A
+  swap quoted before the key was recorded cannot be checked, and ends with a
+  warning in the log. A swap that had already paid out does not end. That one is
   logged as `swap did not finish` and left in the journal, since the deleted
   invoice was its only claim and only a person can rule out the bridge
   reading the wrong node; each restart drives it again and stops it again.
@@ -224,6 +227,13 @@ none of the swaps in its journal, so finish them first: stop taking quotes
 and let every swap in the journal end before upgrading, or, if the new
 binary refuses the configuration with swaps still open, start the old binary
 on it again until they have finished, then fix the configuration.
+
+From v0.1.9 the journal records the identity key of the node that issued each
+swap's hold invoice (`incoming_node`), and a quote asks the incoming node for
+it before anything is created. Swaps already in the journal have none and are
+handled as before; an older binary reading the journal ignores the field. For
+Go code that implements `node.Incoming` itself, the interface gains
+`IdentityKey`, the node's compressed identity key in lower-case hex.
 
 ## Status
 

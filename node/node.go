@@ -294,6 +294,13 @@ type Incoming interface {
 	// BlockHeight is the tip this node sees, used to turn an expiry height
 	// into blocks remaining.
 	BlockHeight(ctx context.Context) (int32, error)
+
+	// IdentityKey is the node's identity public key, compressed and
+	// hex-encoded. A swap records the key of the node that issued its hold
+	// invoice, because a node that has no record of the invoice gives the
+	// same answer whether it deleted it or never issued it, and only the
+	// first lets the bridge end the swap.
+	IdentityKey(ctx context.Context) (string, error)
 }
 
 // Decoded is a payment request the bridge has been asked to pay, as the node

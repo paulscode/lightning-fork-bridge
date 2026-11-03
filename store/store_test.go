@@ -1086,6 +1086,49 @@ func TestTheParticipantSurvivesTheJournal(t *testing.T) {
 	}
 }
 
+// TestTheIssuingNodeSurvivesTheJournal, and a key that could match no node
+// is refused rather than stored to stop a swap for nothing later.
+func TestTheIssuingNodeSurvivesTheJournal(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "swaps.journal")
+	key := "02" + strings.Repeat("ab", 32)
+
+	j := open(t, path)
+	r := rec(1, swap.Offered)
+	r.IncomingNode = key
+	if err := j.Put(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Compact(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	j = open(t, path)
+	defer j.Close()
+	got, err := j.Get(ctx, r.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.IncomingNode != key {
+		t.Errorf("issuing node %q after a reopen", got.IncomingNode)
+	}
+
+	for _, bad := range []string{
+		"02" + strings.Repeat("AB", 32),
+		"02" + strings.Repeat("ab", 31),
+		"not hex",
+	} {
+		r := rec(2, swap.Offered)
+		r.IncomingNode = bad
+		if err := j.Put(ctx, r); !errors.Is(err, ErrRecord) {
+			t.Errorf("%q: want ErrRecord, got %v", bad, err)
+		}
+	}
+}
+
 // TestCommittedWhereCountsOnlyWhatItIsAsked: per direction, the two chains'
 // amounts are never summed into one number.
 func TestCommittedWhereCountsOnlyWhatItIsAsked(t *testing.T) {

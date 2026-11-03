@@ -235,7 +235,7 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 	// Everything else is decided by what the incoming node says.
 	inv, err := d.In.LookupInvoice(ctx, sw.Hash)
 	if errors.Is(err, node.ErrUnknownHash) {
-		return d.resumeForgotten(sw)
+		return d.resumeForgotten(ctx, sw)
 	}
 	if err != nil {
 		return 0, false, fmt.Errorf("reading the incoming invoice: %w", err)
@@ -298,19 +298,58 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 // once with gc-canceled-invoices-on-the-fly. A cancelled invoice holds no
 // HTLC and cannot be paid again, so every state that has not paid out ends
 // as if the cancel had been seen; retrying the lookup would never get another
-// answer. If instead the bridge is reading the wrong node, ending these swaps
-// still pays nothing out, and the node that does hold an HTLC gives it back
-// at its own height expiry.
+// answer.
+//
+// Another node gives the same answer, and there the issuer may still hold the
+// payer's HTLC, or still offer an invoice they can pay, with nothing driving
+// either. So a swap that recorded its issuer ends only when the node asked is
+// that one; on another the swap stops for an operator, and is driven again
+// once the bridge is pointed back at its issuer. A record from before issuers
+// were recorded cannot be checked and ends as above, with a warning.
 //
 // Paid is the exception: the payout has gone and settling the incoming HTLC
 // is the only claim against it. Whether that claim is truly gone, or the node
 // is not the one that held it, is for an operator to establish.
-func (d *Driver) resumeForgotten(sw *Swap) (swap.Event, bool, error) {
+func (d *Driver) resumeForgotten(ctx context.Context, sw *Swap) (swap.Event,
+	bool, error) {
+
+	if sw.State == swap.Quoted {
+		// Nothing was ever created.
+		return 0, false, nil
+	}
+	if sw.IncomingNode != "" {
+		key, err := d.In.IdentityKey(ctx)
+		if err != nil {
+			return 0, false, fmt.Errorf("the incoming node has no "+
+				"record of the hold invoice, and could not be asked "+
+				"who it is: %w", err)
+		}
+		if key != sw.IncomingNode {
+			return 0, false, fmt.Errorf("%w: the hold invoice was "+
+				"issued by incoming node %s, and the bridge is "+
+				"connected to %s, which has no record of it. Point "+
+				"the bridge back at the node that issued it; the "+
+				"swap is driven again when the bridge restarts",
+				ErrNeedsOperator, sw.IncomingNode, key)
+		}
+	}
+
 	switch sw.State {
 	case swap.Offered, swap.Funded:
-		// Warned, because the bridge never asked for this cancel, and the
-		// same answer from the wrong node would end the swap while the
-		// right one still holds an HTLC until its expiry.
+		if sw.IncomingNode != "" {
+			// Its issuer said so: deleted, by hand or by a node
+			// that collects cancelled invoices.
+			d.log().Info("the node that issued the hold invoice has "+
+				"no record of it; ending the swap as given back",
+				"swap", fmt.Sprintf("%x", sw.Hash[:8]),
+				"state", sw.State.String())
+
+			break
+		}
+		// Warned, because a record this old does not say which node
+		// issued its invoice, and the same answer from the wrong node
+		// would end the swap while the right one still holds an HTLC
+		// until its expiry.
 		d.log().Warn("the incoming node has no record of the hold "+
 			"invoice; ending the swap as given back, since a node "+
 			"deletes only a cancelled invoice. If the bridge is not "+
@@ -330,10 +369,6 @@ func (d *Driver) resumeForgotten(sw *Swap) (swap.Event, bool, error) {
 	}
 
 	switch sw.State {
-	case swap.Quoted:
-		// Nothing was ever created.
-		return 0, false, nil
-
 	case swap.Offered:
 		// Unpaid, and now unpayable.
 		return swap.IncomingLapsed, true, nil
@@ -349,6 +384,15 @@ func (d *Driver) resumeForgotten(sw *Swap) (swap.Event, bool, error) {
 		return swap.IncomingCancelled, true, nil
 
 	case swap.Paid:
+		if sw.IncomingNode != "" {
+			return 0, false, fmt.Errorf("%w: paid out, but the node "+
+				"that issued the hold invoice has no record of it, "+
+				"so the incoming HTLC cannot be settled. Check that "+
+				"its database was not restored from an older backup; "+
+				"if the invoice was cancelled and deleted, the payout "+
+				"is lost", ErrNeedsOperator)
+		}
+
 		return 0, false, fmt.Errorf("%w: paid out, but the incoming node "+
 			"has no record of the hold invoice, so the incoming HTLC "+
 			"cannot be settled. Check that the bridge is connected to "+

@@ -723,6 +723,16 @@ func (q *Quoter) fits(ctx context.Context, amountMsat uint64) error {
 func (q *Quoter) reserve(ctx context.Context, terms *Quote, dec node.Decoded,
 	who string, forget bool) (store.Record, time.Duration, error) {
 
+	// The node about to issue the hold invoice, recorded with the quote so
+	// that the driver can tell this node deleting the invoice from another
+	// node never having had it. Asked before the room is taken, since it
+	// waits on the node.
+	issuer, err := q.In.IdentityKey(ctx)
+	if err != nil {
+		return store.Record{}, 0, fmt.Errorf("%w: asking the incoming "+
+			"node for its identity: %w", ErrRefused, err)
+	}
+
 	q.roomMu.Lock()
 	defer q.roomMu.Unlock()
 
@@ -767,6 +777,7 @@ func (q *Quoter) reserve(ctx context.Context, terms *Quote, dec node.Decoded,
 		Participant:       who,
 		NoPayAttempt:      true,
 		NoInvoice:         true,
+		IncomingNode:      issuer,
 	}
 	if err := q.Store.Put(ctx, rec); err != nil {
 		return store.Record{}, 0, fmt.Errorf("recording the quote: %w",

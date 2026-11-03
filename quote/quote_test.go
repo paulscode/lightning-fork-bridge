@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -41,6 +42,16 @@ type fakeIn struct {
 
 	forgotten int
 	forgetErr error
+
+	// keyErr is a failure to say who the node is.
+	keyErr error
+}
+
+// issuerKey is the identity of the node the tests quote on.
+var issuerKey = "02" + strings.Repeat("ab", 32)
+
+func (f *fakeIn) IdentityKey(context.Context) (string, error) {
+	return issuerKey, f.keyErr
 }
 
 func (f *fakeIn) ForgetInvoice(context.Context, node.Hash) error {
@@ -216,6 +227,9 @@ func TestAQuoteIsAWholeSwap(t *testing.T) {
 	}
 	if rec.Invoice != "lnbc1originalinvoice" {
 		t.Errorf("the record does not hold the invoice to pay: %q", rec.Invoice)
+	}
+	if rec.IncomingNode != issuerKey {
+		t.Errorf("the record names %q as the issuing node", rec.IncomingNode)
 	}
 	if rec.OutgoingCLTVLimit != DefaultPolicy.OutgoingCLTVLimit {
 		t.Errorf("CLTV limit %d", rec.OutgoingCLTVLimit)
@@ -762,6 +776,10 @@ type slowIn struct {
 }
 
 func (s *slowIn) ForgetInvoice(context.Context, node.Hash) error { return nil }
+
+func (s *slowIn) IdentityKey(context.Context) (string, error) {
+	return issuerKey, nil
+}
 
 func (s *slowIn) AddHoldInvoice(context.Context, node.HoldInvoice) (string,
 	error) {
@@ -1328,5 +1346,26 @@ func TestHeadroomCoversTheRoutingBudget(t *testing.T) {
 			t.Errorf("room %d for %d msat and a %d msat budget: code %q "+
 				"(%v)", c.room, d.AmountMsat, fee, CodeOf(err), err)
 		}
+	}
+}
+
+// TestANodeThatCannotSayWhoItIsIsNotQuotedOn: the swap records the node that
+// issues its hold invoice, so that a "no record" from another node is never
+// taken for a deleted invoice. A quote that cannot record it creates nothing.
+func TestANodeThatCannotSayWhoItIsIsNotQuotedOn(t *testing.T) {
+	ctx := context.Background()
+	in := &fakeIn{keyErr: errors.New("connection refused")}
+	q, st := build(t, in, &fakeOut{decoded: decoded()}, 0.01)
+
+	if _, err := q.Quote(ctx, "lnbc1originalinvoice"); !errors.Is(err,
+		ErrRefused) {
+
+		t.Fatalf("want ErrRefused, got %v", err)
+	}
+	if in.asked != nil {
+		t.Error("a hold invoice was created")
+	}
+	if _, err := st.Get(ctx, hash); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("a record was written: %v", err)
 	}
 }

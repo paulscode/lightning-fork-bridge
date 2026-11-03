@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1219,5 +1220,32 @@ func TestARefusalBeforeThePaymentExistsIsNotSent(t *testing.T) {
 				t.Errorf("state %v, want in flight", got.State)
 			}
 		})
+	}
+}
+
+// TestIdentityKeyIsTheNodesKey: the key a swap records as its issuer, in the
+// lower-case form the journal holds, and nothing that could not be one.
+func TestIdentityKeyIsTheNodesKey(t *testing.T) {
+	ctx := context.Background()
+	key := "02" + strings.Repeat("ab", 32)
+
+	for _, tc := range []struct {
+		name string
+		f    *fakeNode
+		want string
+	}{
+		{"as given", &fakeNode{info: &lnrpc.GetInfoResponse{
+			IdentityPubkey: key}}, key},
+		{"upper case", &fakeNode{info: &lnrpc.GetInfoResponse{
+			IdentityPubkey: strings.ToUpper(key)}}, key},
+		{"empty", &fakeNode{info: &lnrpc.GetInfoResponse{}}, ""},
+		{"short", &fakeNode{info: &lnrpc.GetInfoResponse{
+			IdentityPubkey: key[:64]}}, ""},
+		{"no answer", &fakeNode{infoErr: errors.New("unavailable")}, ""},
+	} {
+		got, err := NewIncoming(serve(t, tc.f)).IdentityKey(ctx)
+		if got != tc.want || (err == nil) != (tc.want != "") {
+			t.Errorf("%s: %q %v, want %q", tc.name, got, err, tc.want)
+		}
 	}
 }

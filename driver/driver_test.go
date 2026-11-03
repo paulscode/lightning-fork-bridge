@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,22 @@ type fakeIn struct {
 
 	settled   int
 	cancelled int
+
+	// key is the node's identity, issuerKey unless set; keyErr a failure
+	// to say.
+	key    string
+	keyErr error
+}
+
+// issuerKey is the identity of the node the tests' swaps were quoted on.
+var issuerKey = "02" + strings.Repeat("ab", 32)
+
+func (f *fakeIn) IdentityKey(context.Context) (string, error) {
+	if f.key != "" {
+		return f.key, f.keyErr
+	}
+
+	return issuerKey, f.keyErr
 }
 
 func (f *fakeIn) AddHoldInvoice(context.Context, node.HoldInvoice) (string, error) {
@@ -431,6 +448,69 @@ func TestResumeAnInvoiceTheNodeDeleted(t *testing.T) {
 	if ok || !errors.Is(err, ErrNeedsOperator) {
 		t.Errorf("paid out with the invoice gone: %v %v, want "+
 			"ErrNeedsOperator", ok, err)
+	}
+}
+
+// TestADeletedInvoiceEndsASwapOnlyOnItsIssuer: another node has no record of
+// the invoice either, while the issuer may still hold the payer's HTLC. A swap
+// that recorded its issuer ends only when the node asked is that one, stops
+// for an operator on any other, and waits on a node that cannot say who it is.
+func TestADeletedInvoiceEndsASwapOnlyOnItsIssuer(t *testing.T) {
+	ctx := context.Background()
+	other := "03" + strings.Repeat("cd", 32)
+
+	for _, tc := range []struct {
+		state swap.State
+		want  swap.Event
+	}{
+		{swap.Offered, swap.IncomingLapsed},
+		{swap.Funded, swap.MarginRefused},
+		{swap.Failing, swap.IncomingCancelled},
+		{swap.Aborting, swap.IncomingCancelled},
+		{swap.Expiring, swap.IncomingCancelled},
+	} {
+		sw := Swap{State: tc.state, IncomingNode: issuerKey,
+			NoPayAttempt: true}
+		out := &fakeOut{lookup: node.Payment{State: node.PaymentFailed}}
+
+		issuer := &fakeIn{lookupErr: node.ErrUnknownHash}
+		d := &Driver{In: issuer, Out: out, Policy: pol}
+		ev, ok, err := d.Resume(ctx, &sw)
+		if err != nil || !ok || ev != tc.want {
+			t.Errorf("%v on its issuer: %v %v %v, want %v", tc.state, ev,
+				ok, err, tc.want)
+		}
+
+		elsewhere := &fakeIn{lookupErr: node.ErrUnknownHash, key: other}
+		d = &Driver{In: elsewhere, Out: out, Policy: pol}
+		_, ok, err = d.Resume(ctx, &sw)
+		if ok || !errors.Is(err, ErrNeedsOperator) ||
+			!strings.Contains(err.Error(), other) {
+
+			t.Errorf("%v on another node: %v %v, want ErrNeedsOperator "+
+				"naming it", tc.state, ok, err)
+		}
+
+		mute := &fakeIn{lookupErr: node.ErrUnknownHash,
+			keyErr: errors.New("connection refused")}
+		d = &Driver{In: mute, Out: out, Policy: pol}
+		_, ok, err = d.Resume(ctx, &sw)
+		if ok || err == nil || errors.Is(err, ErrNeedsOperator) {
+			t.Errorf("%v with no identity: %v %v, want an error to "+
+				"retry", tc.state, ok, err)
+		}
+	}
+
+	// Paid stops either way; on its issuer it no longer suggests the wrong
+	// node.
+	d := &Driver{In: &fakeIn{lookupErr: node.ErrUnknownHash}, Out: &fakeOut{},
+		Policy: pol}
+	_, ok, err := d.Resume(ctx, &Swap{State: swap.Paid,
+		IncomingNode: issuerKey})
+	if ok || !errors.Is(err, ErrNeedsOperator) ||
+		!strings.Contains(err.Error(), "node that issued the hold invoice") {
+
+		t.Errorf("paid out on its issuer: %v %v", ok, err)
 	}
 }
 

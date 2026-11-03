@@ -46,14 +46,31 @@ type fakeIn struct {
 
 	// onLookup, when set, is called with each lookup's count, before it
 	// answers, and its error returned instead.
-	onLookup  func(ctx context.Context, n int) error
-	height    int32
+	onLookup func(ctx context.Context, n int) error
+	height   int32
+
+	// key is the node's identity, issuerKey unless set.
+	key string
+
 	settled   int
 	cancelled int
 
 	// gc deletes an invoice as soon as it is cancelled, as lnd does with
 	// gc-canceled-invoices-on-the-fly.
 	gc bool
+}
+
+// issuerKey is the identity of the node the tests' swaps were quoted on.
+var issuerKey = "02" + strings.Repeat("ab", 32)
+
+func (f *fakeIn) IdentityKey(context.Context) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.key != "" {
+		return f.key, nil
+	}
+
+	return issuerKey, nil
 }
 
 func (f *fakeIn) set(fn func(*fakeIn)) {
@@ -399,6 +416,42 @@ func TestAPaidSwapWhoseInvoiceWasDeletedStopsForAnOperator(t *testing.T) {
 	}
 	if settled, cancelled := in.counts(); settled != 0 || cancelled != 0 {
 		t.Errorf("settled %d, cancelled %d", settled, cancelled)
+	}
+}
+
+// TestAnOfferedSwapOnAnotherNodeStopsForAnOperator: a bridge pointed at a
+// node other than the one that issued the hold invoice gets the same "no
+// record" as from a node that deleted it. The swap stops where it is, and
+// ends once the bridge reads its issuer again.
+func TestAnOfferedSwapOnAnotherNodeStopsForAnOperator(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{lookupErr: node.ErrUnknownHash, height: 500,
+		key: "03" + strings.Repeat("cd", 32)}
+	rec := record(swap.Offered)
+	rec.IncomingNode = issuerKey
+	r, st := build(t, in, &fakeOut{}, rec)
+
+	err := r.Drive(ctx, hash)
+	if !errors.Is(err, driver.ErrNeedsOperator) {
+		t.Fatalf("want ErrNeedsOperator, got %v", err)
+	}
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Offered {
+		t.Fatalf("ended in %v", final.State)
+	}
+
+	// Pointed back at its issuer, which did delete it.
+	in.mu.Lock()
+	in.key = ""
+	in.mu.Unlock()
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+	final, _ = st.Get(context.Background(), hash)
+	if final.State != swap.Expired {
+		t.Fatalf("ended in %v", final.State)
 	}
 }
 

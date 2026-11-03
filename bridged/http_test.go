@@ -67,6 +67,10 @@ func (f *fakeIn) LookupInvoice(_ context.Context, hash node.Hash) (node.Invoice,
 
 	return node.Invoice{}, node.ErrUnknownHash
 }
+func (f *fakeIn) IdentityKey(context.Context) (string, error) {
+	return "02" + strings.Repeat("ab", 32), nil
+}
+
 func (f *fakeIn) SettleInvoice(context.Context, node.Preimage) error { return nil }
 func (f *fakeIn) CancelInvoice(context.Context, node.Hash) error     { return nil }
 func (f *fakeIn) ForgetInvoice(context.Context, node.Hash) error     { return nil }
